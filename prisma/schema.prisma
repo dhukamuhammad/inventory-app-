@@ -1,0 +1,47 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+}
+
+model Category {
+  id        String    @id @default(uuid())
+  name      String    @unique
+  products  Product[]
+}
+
+model Platform {
+  id        String          @id @default(uuid())
+  name      String          @unique
+  movements StockMovement[]
+}
+
+model Product {
+  id              String          @id @default(uuid())
+  name            String
+  sku             String          @unique
+  categoryId      String
+  category        Category        @relation(fields: [categoryId], references: [id])
+  costPrice       Float           @default(0)
+  currentStock    Int             @default(0)
+  defectiveStock  Int             @default(0)
+  lowStockAlertAt Int             @default(5)
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  movements       StockMovement[]
+}
+
+model StockMovement {
+  id         String    @id @default(uuid())
+  productId  String
+  product    Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  type       String    // "IN" or "OUT"
+  quantity   Int
+  unitCost   Float?
+  platformId String?
+  platform   Platform? @relation(fields: [platformId], references: [id])
+  note       String?
+  date       DateTime  @default(now())
+}
