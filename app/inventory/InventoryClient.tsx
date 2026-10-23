@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Plus, Package } from "lucide-react";
+import { Plus, Package, Zap } from "lucide-react";
 import { Product, Category } from "@prisma/client";
 import { DesktopTable } from "@/components/inventory/DesktopTable";
 import { MobileCardList } from "@/components/inventory/MobileCardList";
@@ -13,6 +13,7 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { DropdownItem } from "@/components/ui/CustomDropdown";
 import { deleteProduct } from "@/app/actions/inventory";
 import { ProductInsightsDrawer } from "@/components/inventory/ProductInsightsDrawer";
+import { BulkDispatchModal } from "@/components/inventory/BulkDispatchModal";
 
 type ProductWithCategory = Product & { category: Category };
 
@@ -24,6 +25,7 @@ interface InventoryClientProps {
 
 export function InventoryClient({ products, categories, platforms }: InventoryClientProps) {
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const [isBulkDispatchOpen, setIsBulkDispatchOpen] = useState(false);
   const [insightsProductId, setInsightsProductId] = useState<string | null>(null);
   const [insightsInitialTab, setInsightsInitialTab] = useState<"OVERVIEW" | "PLATFORMS" | "HISTORY">("OVERVIEW");
 
@@ -102,39 +104,60 @@ export function InventoryClient({ products, categories, platforms }: InventoryCl
   return (
     <div className="space-y-4 sm:space-y-6">
       {/* 📱 Mobile App Header (md:hidden) */}
-      <div className="md:hidden flex items-center justify-between pt-1">
-        <div>
+      <div className="md:hidden flex items-center justify-between pt-1 gap-2">
+        <div className="min-w-0 flex-1">
           <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-blue-50 text-blue-700 border border-blue-100">
             <Package className="w-3.5 h-3.5 text-blue-600" />
             {products.length} Products
             {lowStockCount > 0 && ` • ${lowStockCount} Low`}
           </span>
-          <h1 className="text-xl font-bold text-gray-900 mt-1">Inventory</h1>
+          <h1 className="text-xl font-bold text-gray-900 mt-1 truncate">Inventory</h1>
         </div>
-        <button 
-          type="button"
-          onClick={() => setIsAddModalOpen(true)}
-          className="inline-flex items-center gap-1.5 bg-blue-600 active:bg-blue-700 text-white px-3.5 py-2 rounded-xl text-xs font-semibold shadow-sm shadow-blue-200 transition-all active:scale-95 touch-manipulation cursor-pointer"
-        >
-          <Plus className="w-4 h-4" />
-          Add Product
-        </button>
+        <div className="flex items-center gap-1.5 shrink-0">
+          <button 
+            type="button"
+            onClick={() => setIsBulkDispatchOpen(true)}
+            className="inline-flex items-center gap-1 bg-gradient-to-r from-indigo-600 to-blue-600 active:from-indigo-700 active:to-blue-700 text-white px-2.5 py-2 rounded-xl text-xs font-semibold shadow-xs transition-all active:scale-95 touch-manipulation cursor-pointer"
+            title="Auto-dispatch Flipkart & Meesho orders via PDF label"
+          >
+            <Zap className="w-3.5 h-3.5 fill-amber-300" />
+            <span>Dispatch</span>
+          </button>
+          <button 
+            type="button"
+            onClick={() => setIsAddModalOpen(true)}
+            className="inline-flex items-center gap-1 bg-blue-600 active:bg-blue-700 text-white px-2.5 py-2 rounded-xl text-xs font-semibold shadow-sm shadow-blue-200 transition-all active:scale-95 touch-manipulation cursor-pointer"
+          >
+            <Plus className="w-4 h-4" />
+            <span>Add</span>
+          </button>
+        </div>
       </div>
 
-      {/* 🖥️ Desktop Header (hidden md:flex) — Exact Original Design */}
+      {/* 🖥️ Desktop Header (hidden md:flex) */}
       <div className="hidden md:flex justify-between items-center gap-4 bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Inventory</h1>
-          <p className="text-gray-500 mt-1">Manage your products and stock</p>
+          <p className="text-gray-500 mt-1">Manage your products, automated dispatch, and stock</p>
         </div>
-        <button 
-          type="button"
-          onClick={() => setIsAddModalOpen(true)}
-          className="w-full sm:w-auto inline-flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-6 py-2.5 rounded-xl font-medium transition-all active:scale-95 shadow-sm shadow-blue-200 cursor-pointer touch-manipulation"
-        >
-          <Plus className="w-5 h-5" />
-          Add Product
-        </button>
+        <div className="flex items-center gap-3">
+          <button 
+            type="button"
+            onClick={() => setIsBulkDispatchOpen(true)}
+            className="inline-flex items-center justify-center gap-2 bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-700 hover:to-blue-700 text-white px-4 py-2.5 rounded-xl font-medium transition-all active:scale-95 shadow-sm shadow-indigo-200 cursor-pointer touch-manipulation"
+          >
+            <Zap className="w-4 h-4 fill-amber-300" />
+            Auto Bulk Dispatch
+          </button>
+          <button 
+            type="button"
+            onClick={() => setIsAddModalOpen(true)}
+            className="inline-flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-xl font-medium transition-all active:scale-95 shadow-sm shadow-blue-200 cursor-pointer touch-manipulation"
+          >
+            <Plus className="w-5 h-5" />
+            Add Product
+          </button>
+        </div>
       </div>
 
       {/* Desktop Table View */}
@@ -200,6 +223,11 @@ export function InventoryClient({ products, categories, platforms }: InventoryCl
         confirmText="Delete Product"
         isDestructive={true}
         loading={deleteDialog.loading}
+      />
+
+      <BulkDispatchModal
+        isOpen={isBulkDispatchOpen}
+        onClose={() => setIsBulkDispatchOpen(false)}
       />
     </div>
   );

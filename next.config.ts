@@ -10,7 +10,8 @@ const nextConfig: NextConfig = {
     '10.139.228.206:3000',
     'localhost:3000'
   ],
-  output: 'standalone'
+  output: 'standalone',
+  serverExternalPackages: ['pdf-parse', '@napi-rs/canvas'],
 };
 
 export default nextConfig;

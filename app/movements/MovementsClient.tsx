@@ -24,6 +24,8 @@ import {
   Clock
 } from "lucide-react";
 import { deleteStockMovement } from "@/app/actions/inventory";
+import { Zap } from "lucide-react";
+import { BulkDispatchModal } from "@/components/inventory/BulkDispatchModal";
 
 interface ProductItem {
   id: string;
@@ -172,6 +174,7 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
   // Custom Modals State (No ugly browser window.confirm!)
   const [isDateModalOpen, setIsDateModalOpen] = useState(false);
   const [isChannelModalOpen, setIsChannelModalOpen] = useState(false);
+  const [isBulkDispatchOpen, setIsBulkDispatchOpen] = useState(false);
   const [movementToRevert, setMovementToRevert] = useState<MovementItem | null>(null);
   const [isReverting, setIsReverting] = useState(false);
 
@@ -408,12 +411,22 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
           </div>
         </div>
 
-        <Link
-          href="/inventory"
-          className="text-xs font-semibold px-2.5 py-1.5 bg-gray-100 text-gray-700 rounded-xl active:bg-gray-200"
-        >
-          Inventory →
-        </Link>
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => setIsBulkDispatchOpen(true)}
+            className="inline-flex items-center gap-1 text-xs font-semibold px-2.5 py-1.5 bg-gradient-to-r from-indigo-600 to-blue-600 text-white rounded-xl shadow-xs active:scale-95 touch-manipulation cursor-pointer"
+          >
+            <Zap className="w-3.5 h-3.5 fill-amber-300" />
+            <span>Dispatch</span>
+          </button>
+          <Link
+            href="/inventory"
+            className="text-xs font-semibold px-2.5 py-1.5 bg-gray-100 text-gray-700 rounded-xl active:bg-gray-200"
+          >
+            Inventory →
+          </Link>
+        </div>
       </div>
 
       {/* ============================================================== */}
@@ -438,6 +451,14 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
         </div>
 
         <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => setIsBulkDispatchOpen(true)}
+            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-700 hover:to-blue-700 rounded-xl transition-all shadow-xs cursor-pointer active:scale-95"
+          >
+            <Zap className="w-4 h-4 fill-amber-300" />
+            Auto Bulk Dispatch
+          </button>
           <Link
             href="/inventory"
             className="px-4 py-2 text-sm font-semibold text-gray-700 bg-white border border-gray-200 rounded-xl hover:bg-gray-50 transition-colors shadow-sm"
@@ -1245,6 +1266,11 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
           </div>
         </div>
       )}
+
+      <BulkDispatchModal
+        isOpen={isBulkDispatchOpen}
+        onClose={() => setIsBulkDispatchOpen(false)}
+      />
     </div>
   );
 }
