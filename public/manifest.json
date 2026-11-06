@@ -4,8 +4,8 @@
   "description": "ScoviX E-Commerce Inventory & Dispatch Management System",
   "start_url": "/dashboard",
   "display": "standalone",
-  "background_color": "#0b0f19",
-  "theme_color": "#4f46e5",
+  "background_color": "#ffffff",
+  "theme_color": "#2563eb",
   "icons": [
     {
       "src": "/icons/icon-192.png",
