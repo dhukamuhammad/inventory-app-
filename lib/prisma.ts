@@ -14,8 +14,31 @@ declare const globalThis: {
   prismaGlobal: ReturnType<typeof prismaClientSingleton>;
 } & typeof global;
 
-const prisma = globalThis.prismaGlobal ?? prismaClientSingleton()
+function getPrismaClient(): PrismaClient {
+  if (!globalThis.prismaGlobal || !(globalThis.prismaGlobal as any).dispatchedOrder) {
+    if (globalThis.prismaGlobal) {
+      try {
+        (globalThis.prismaGlobal as any).$disconnect?.();
+      } catch (e) {}
+    }
+    globalThis.prismaGlobal = prismaClientSingleton();
+  }
+  return globalThis.prismaGlobal;
+}
 
-export default prisma
+const prisma = new Proxy({} as PrismaClient, {
+  get(_target, prop) {
+    const client = getPrismaClient();
+    const value = Reflect.get(client, prop, client);
+    if (typeof value === 'function') {
+      return value.bind(client);
+    }
+    return value;
+  },
+});
 
-if (process.env.NODE_ENV !== 'production') globalThis.prismaGlobal = prisma
+export default prisma;
+
+if (process.env.NODE_ENV !== 'production') {
+  globalThis.prismaGlobal = getPrismaClient();
+}

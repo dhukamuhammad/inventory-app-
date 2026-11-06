@@ -21,9 +21,12 @@ import {
   ChevronDown,
   Check,
   AlertCircle,
-  Clock
+  Clock,
+  User,
+  Handshake,
+  Pencil
 } from "lucide-react";
-import { deleteStockMovement } from "@/app/actions/inventory";
+import { deleteStockMovement, updateStockMovement } from "@/app/actions/inventory";
 import { Zap } from "lucide-react";
 import { BulkDispatchModal } from "@/components/inventory/BulkDispatchModal";
 
@@ -48,6 +51,8 @@ interface MovementItem {
   platformId: string | null;
   note: string | null;
   date: Date | string;
+  isEdited?: boolean;
+  updatedAt?: Date | string | null;
   product: ProductItem;
   platform: {
     id: string;
@@ -178,6 +183,19 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
   const [movementToRevert, setMovementToRevert] = useState<MovementItem | null>(null);
   const [isReverting, setIsReverting] = useState(false);
 
+  // Edit Stock Movement State
+  const [movementToEdit, setMovementToEdit] = useState<MovementItem | null>(null);
+  const [editFormData, setEditFormData] = useState({
+    quantity: "",
+    unitCost: "",
+    platformId: "MANUAL",
+    recipientName: "",
+    note: "",
+    date: "",
+  });
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 25;
 
@@ -194,6 +212,92 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
       alert(err?.message || "Failed to revert entry. Please try again.");
     } finally {
       setIsReverting(false);
+    }
+  };
+
+  const handleOpenEditModal = (m: MovementItem) => {
+    let parsedRecipient = "";
+    let parsedNote = m.note || "";
+
+    if (m.note && m.note.includes("Given To:")) {
+      const parts = m.note.split("|");
+      parsedRecipient = parts[0].replace("Given To:", "").trim();
+      parsedNote = parts.slice(1).join(" | ").trim();
+    }
+
+    const d = new Date(m.date);
+    const tzOffset = d.getTimezoneOffset() * 60000;
+    const localISOTime = new Date(d.getTime() - tzOffset).toISOString().slice(0, 16);
+
+    setEditFormData({
+      quantity: String(m.quantity || ""),
+      unitCost: m.unitCost ? String(m.unitCost) : "",
+      platformId: m.platformId || "MANUAL",
+      recipientName: parsedRecipient,
+      note: parsedNote,
+      date: localISOTime,
+    });
+    setUpdateError(null);
+    setMovementToEdit(m);
+  };
+
+  const handleSaveMovementEdit = async () => {
+    if (!movementToEdit) return;
+    const qty = Number(editFormData.quantity);
+    if (!qty || qty <= 0) {
+      setUpdateError("Please enter a valid quantity greater than 0");
+      return;
+    }
+
+    try {
+      setIsUpdating(true);
+      setUpdateError(null);
+
+      let finalNote: string | undefined = undefined;
+      if (editFormData.recipientName.trim()) {
+        const parts = [
+          `Given To: ${editFormData.recipientName.trim()}`,
+          editFormData.note.trim() ? editFormData.note.trim() : "",
+        ].filter(Boolean);
+        finalNote = parts.join(" | ");
+      } else {
+        finalNote = editFormData.note.trim() || undefined;
+      }
+
+      const res = await updateStockMovement({
+        movementId: movementToEdit.id,
+        quantity: qty,
+        unitCost: editFormData.unitCost ? Number(editFormData.unitCost) : null,
+        platformId: editFormData.platformId === "MANUAL" ? null : editFormData.platformId,
+        note: finalNote,
+        date: editFormData.date ? new Date(editFormData.date) : undefined,
+      });
+
+      if (res?.updatedMovement) {
+        setMovements((prev) =>
+          prev.map((item) =>
+            item.id === movementToEdit.id
+              ? {
+                  ...item,
+                  quantity: res.updatedMovement.quantity,
+                  unitCost: res.updatedMovement.unitCost,
+                  platformId: res.updatedMovement.platformId,
+                  platform: res.updatedMovement.platform,
+                  note: res.updatedMovement.note,
+                  date: res.updatedMovement.date,
+                  isEdited: true,
+                  updatedAt: res.updatedMovement.updatedAt,
+                }
+              : item
+          )
+        );
+      }
+      setMovementToEdit(null);
+    } catch (err: any) {
+      console.error("Failed to update movement:", err);
+      setUpdateError(err?.message || "Failed to update entry");
+    } finally {
+      setIsUpdating(false);
     }
   };
 
@@ -393,7 +497,7 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
       : platforms.find(p => p.id === selectedPlatformId)?.name || "Channel";
 
   return (
-    <div className="space-y-4 md:space-y-6 pb-24 md:pb-8">
+    <div className="max-w-7xl mx-auto pb-32 md:pb-16 space-y-4 sm:space-y-6 animate-in fade-in duration-200">
       {/* ============================================================== */}
       {/* 📱 Mobile Top App Bar                                          */}
       {/* ============================================================== */}
@@ -430,41 +534,204 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
       </div>
 
       {/* ============================================================== */}
-      {/* 🖥️ Desktop Header                                              */}
+      {/* 🖥️ 1. DESKTOP HEADER (hidden md:flex) — Matches Dashboard Theme */}
       {/* ============================================================== */}
-      <div className="hidden md:flex items-center justify-between">
+      <div className="hidden md:flex justify-between items-center gap-4 bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
         <div>
           <div className="flex items-center gap-2 mb-1">
             <Link
               href="/dashboard"
-              className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 hover:text-blue-600 transition-colors"
+              className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 hover:text-indigo-600 transition-colors"
             >
               <ArrowLeft className="w-3.5 h-3.5" /> Back to Dashboard
             </Link>
             <span className="text-gray-300">•</span>
-            <span className="text-xs text-gray-400">Ledger & Audit Trail</span>
+            <span className="text-xs text-gray-400 font-medium">Ledger & Audit Trail</span>
           </div>
           <h1 className="text-2xl font-bold text-gray-900">Stock Movements & Ledger</h1>
-          <p className="mt-1 text-sm text-gray-500">
-            Chronological audit log of all restocks, marketplace dispatches, and customer/RTO returns.
+          <p className="text-gray-500 mt-1 text-sm">
+            Chronological audit log of all restocks, marketplace dispatches, customer returns, and direct handovers
           </p>
         </div>
 
         <div className="flex items-center gap-3">
+          <Link
+            href="/inventory"
+            className="inline-flex items-center justify-center gap-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200/80 px-4 py-2.5 rounded-xl font-medium transition-all active:scale-95 shadow-xs cursor-pointer text-xs"
+          >
+            Manage Inventory
+          </Link>
           <button
             type="button"
             onClick={() => setIsBulkDispatchOpen(true)}
-            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-700 hover:to-blue-700 rounded-xl transition-all shadow-xs cursor-pointer active:scale-95"
+            className="inline-flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2.5 rounded-xl font-medium transition-all active:scale-95 shadow-xs shadow-indigo-200 cursor-pointer text-xs"
           >
             <Zap className="w-4 h-4 fill-amber-300" />
             Auto Bulk Dispatch
           </button>
-          <Link
-            href="/inventory"
-            className="px-4 py-2 text-sm font-semibold text-gray-700 bg-white border border-gray-200 rounded-xl hover:bg-gray-50 transition-colors shadow-sm"
-          >
-            Manage Inventory
-          </Link>
+        </div>
+      </div>
+
+      {/* ============================================================== */}
+      {/* 🖥️ 2. DESKTOP SUMMARY CARDS GRID (hidden md:grid)              */}
+      {/* ============================================================== */}
+      <div className="hidden md:grid grid-cols-4 gap-4">
+        <div className="bg-white rounded-2xl p-4 border border-gray-100 shadow-sm flex items-center justify-between">
+          <div>
+            <p className="text-xs text-gray-500 font-medium">Filtered Entries</p>
+            <p className="text-2xl font-bold text-gray-900 mt-1">{stats.totalLogs}</p>
+          </div>
+          <div className="w-10 h-10 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center">
+            <Layers className="w-5 h-5" />
+          </div>
+        </div>
+
+        <div className="bg-white rounded-2xl p-4 border border-gray-100 shadow-sm flex items-center justify-between">
+          <div>
+            <p className="text-xs text-gray-500 font-medium">Stock Restocked (IN)</p>
+            <p className="text-2xl font-bold text-emerald-600 mt-1">+{stats.totalIn} <span className="text-xs font-normal text-emerald-600">pcs</span></p>
+          </div>
+          <div className="w-10 h-10 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center">
+            <ArrowDownRight className="w-5 h-5" />
+          </div>
+        </div>
+
+        <div className="bg-white rounded-2xl p-4 border border-gray-100 shadow-sm flex items-center justify-between">
+          <div>
+            <p className="text-xs text-gray-500 font-medium">Sold / Dispatched (OUT)</p>
+            <p className="text-2xl font-bold text-rose-600 mt-1">-{stats.totalOut} <span className="text-xs font-normal text-rose-600">pcs</span></p>
+          </div>
+          <div className="w-10 h-10 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center">
+            <ArrowUpRight className="w-5 h-5" />
+          </div>
+        </div>
+
+        <div className="bg-white rounded-2xl p-4 border border-gray-100 shadow-sm flex items-center justify-between">
+          <div>
+            <p className="text-xs text-gray-500 font-medium">Total Returns</p>
+            <p className="text-2xl font-bold text-amber-600 mt-1">↺{stats.totalReturns} <span className="text-xs font-normal text-amber-600">pcs</span></p>
+          </div>
+          <div className="w-10 h-10 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center">
+            <Undo2 className="w-5 h-5" />
+          </div>
+        </div>
+      </div>
+
+      {/* ============================================================== */}
+      {/* 🖥️ 3. DESKTOP FILTER BAR (hidden md:block)                     */}
+      {/* ============================================================== */}
+      <div className="hidden md:block bg-white p-4 rounded-2xl border border-gray-100 shadow-sm space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          {/* Search Input */}
+          <div className="relative flex-1 max-w-md">
+            <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => {
+                setSearchQuery(e.target.value);
+                setCurrentPage(1);
+              }}
+              placeholder="Search product name, SKU, channel, note..."
+              className="w-full pl-10 pr-9 py-2 text-xs bg-gray-50 border border-gray-200 rounded-xl outline-none focus:border-indigo-500 focus:bg-white transition-all placeholder:text-gray-400"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => {
+                  setSearchQuery("");
+                  setCurrentPage(1);
+                }}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-gray-400 hover:text-gray-600 rounded-full cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+
+          {/* Trigger Buttons: Date Range & Channel */}
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setIsDateModalOpen(true)}
+              className={`px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 border transition-all cursor-pointer ${
+                dateRange !== "ALL"
+                  ? "bg-indigo-50 text-indigo-700 border-indigo-200 shadow-xs font-bold"
+                  : "bg-gray-50 text-gray-700 border-gray-200 hover:bg-gray-100"
+              }`}
+            >
+              <Calendar className="w-3.5 h-3.5 text-indigo-600" />
+              <span>{dateRangeLabelMap[dateRange]}</span>
+              <ChevronDown className="w-3 h-3 opacity-60" />
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setIsChannelModalOpen(true)}
+              className={`px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 border transition-all cursor-pointer ${
+                selectedPlatformId !== "ALL"
+                  ? "bg-indigo-50 text-indigo-700 border-indigo-200 shadow-xs font-bold"
+                  : "bg-gray-50 text-gray-700 border-gray-200 hover:bg-gray-100"
+              }`}
+            >
+              <Store className="w-3.5 h-3.5 text-indigo-600" />
+              <span>{selectedChannelName}</span>
+              <ChevronDown className="w-3 h-3 opacity-60" />
+            </button>
+
+            {activeFiltersCount > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  setSearchQuery("");
+                  setActiveFilter("ALL");
+                  setDateRange("ALL");
+                  setSelectedPlatformId("ALL");
+                  setCustomDates({ start: "", end: "" });
+                  setCurrentPage(1);
+                }}
+                className="text-xs font-semibold text-rose-600 hover:text-rose-700 px-2.5 py-2 rounded-xl hover:bg-rose-50 transition-colors cursor-pointer"
+              >
+                Reset ({activeFiltersCount})
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Movement Type Quick Pills */}
+        <div className="flex items-center gap-1.5 pt-2 border-t border-gray-100 overflow-x-auto no-scrollbar">
+          <span className="text-[10px] font-bold text-gray-400 uppercase mr-1 shrink-0 flex items-center gap-1">
+            <Filter className="w-3 h-3" /> Type:
+          </span>
+          {[
+            { id: "ALL", label: "All Logs" },
+            { id: "IN", label: "Stock IN (+)" },
+            { id: "OUT", label: "Dispatched (-)" },
+            { id: "RETURNS_ALL", label: "All Returns (↺)" },
+            { id: "RETURN_RTO", label: "RTO Good" },
+            { id: "RETURN_RTO_DEFECTIVE", label: "RTO Defect" },
+            { id: "RETURN_GOOD", label: "Cust Good" },
+            { id: "RETURN_DEFECTIVE", label: "Cust Defect" },
+          ].map((chip) => {
+            const isSelected = activeFilter === chip.id;
+            return (
+              <button
+                key={chip.id}
+                type="button"
+                onClick={() => {
+                  setActiveFilter(chip.id as FilterType);
+                  setCurrentPage(1);
+                }}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap transition-all cursor-pointer ${
+                  isSelected
+                    ? "bg-indigo-600 text-white shadow-xs"
+                    : "bg-gray-50 text-gray-600 hover:bg-gray-100 border border-gray-200"
+                }`}
+              >
+                {chip.label}
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -506,54 +773,9 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
       </div>
 
       {/* ============================================================== */}
-      {/* 🖥️ Desktop Summary Cards Grid                                  */}
+      {/* 📱 Mobile Interactive Filter Toolbar & Trigger Buttons         */}
       {/* ============================================================== */}
-      <div className="hidden md:grid grid-cols-4 gap-3">
-        <div className="bg-white rounded-2xl p-4 border border-gray-100 shadow-sm flex items-center justify-between">
-          <div>
-            <p className="text-xs text-gray-500 font-medium">Filtered Entries</p>
-            <p className="text-xl font-bold text-gray-900 mt-0.5">{stats.totalLogs}</p>
-          </div>
-          <div className="w-9 h-9 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center font-bold">
-            <Layers className="w-4 h-4" />
-          </div>
-        </div>
-
-        <div className="bg-white rounded-2xl p-4 border border-gray-100 shadow-sm flex items-center justify-between">
-          <div>
-            <p className="text-xs text-gray-500 font-medium">Stock Restocked</p>
-            <p className="text-xl font-bold text-emerald-700 mt-0.5">+{stats.totalIn} pcs</p>
-          </div>
-          <div className="w-9 h-9 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center font-bold">
-            <ArrowDownRight className="w-4 h-4" />
-          </div>
-        </div>
-
-        <div className="bg-white rounded-2xl p-4 border border-gray-100 shadow-sm flex items-center justify-between">
-          <div>
-            <p className="text-xs text-gray-500 font-medium">Orders Sold</p>
-            <p className="text-xl font-bold text-rose-700 mt-0.5">-{stats.totalOut} pcs</p>
-          </div>
-          <div className="w-9 h-9 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center font-bold">
-            <ArrowUpRight className="w-4 h-4" />
-          </div>
-        </div>
-
-        <div className="bg-white rounded-2xl p-4 border border-gray-100 shadow-sm flex items-center justify-between">
-          <div>
-            <p className="text-xs text-gray-500 font-medium">Total Returns</p>
-            <p className="text-xl font-bold text-orange-700 mt-0.5">↺{stats.totalReturns} pcs</p>
-          </div>
-          <div className="w-9 h-9 rounded-xl bg-orange-50 text-orange-600 flex items-center justify-center font-bold">
-            <Undo2 className="w-4 h-4" />
-          </div>
-        </div>
-      </div>
-
-      {/* ============================================================== */}
-      {/* 🔍 Interactive Filter Toolbar & Trigger Buttons                */}
-      {/* ============================================================== */}
-      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-3.5 md:p-4 space-y-3">
+      <div className="md:hidden bg-white rounded-2xl border border-gray-100 shadow-sm p-3.5 space-y-3">
         {/* Top: Search Bar + Filter Modals Triggers */}
         <div className="flex flex-col sm:flex-row gap-2.5">
           {/* Search Input */}
@@ -567,7 +789,7 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
                 setCurrentPage(1);
               }}
               placeholder="Search product, SKU, channel, note..."
-              className="w-full pl-10 pr-9 py-2 text-xs md:text-sm bg-gray-50/90 border border-gray-150 rounded-xl outline-none focus:border-indigo-500 focus:bg-white transition-all placeholder:text-gray-400"
+              className="w-full pl-10 pr-9 py-2 text-xs bg-gray-50/90 border border-gray-150 rounded-xl outline-none focus:border-indigo-500 focus:bg-white transition-all placeholder:text-gray-400"
             />
             {searchQuery && (
               <button
@@ -756,12 +978,17 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
                                 <span className="font-mono text-[10px] font-bold text-gray-500 bg-gray-100 px-1.5 py-0.5 rounded">
                                   {m.product.sku}
                                 </span>
-                                {m.platform && (
+                                {m.platform ? (
                                   <span className="text-[10px] font-semibold text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded flex items-center gap-1">
                                     <Store className="w-2.5 h-2.5" />
                                     {m.platform.name}
                                   </span>
-                                )}
+                                ) : m.note?.includes("Given To:") ? (
+                                  <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded flex items-center gap-1 border border-emerald-200/60">
+                                    <Handshake className="w-2.5 h-2.5" />
+                                    Direct Handover
+                                  </span>
+                                ) : null}
                                 {m.product.category && (
                                   <span className="text-[10px] text-gray-400 font-medium">
                                     • {m.product.category.name}
@@ -774,9 +1001,17 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
                               </h4>
 
                               {m.note && (
-                                <p className="text-[11px] text-gray-500 italic mt-0.5 line-clamp-1">
-                                  "{m.note}"
-                                </p>
+                                <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+                                  {m.note.includes("Given To:") && (
+                                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200/60">
+                                      <User className="w-2.5 h-2.5" />
+                                      {m.note.split("|")[0].replace("Given To:", "").trim()}
+                                    </span>
+                                  )}
+                                  <p className="text-[11px] text-gray-500 italic line-clamp-1">
+                                    "{m.note.includes("Given To:") ? (m.note.split("|").slice(1).join(" | ").trim() || m.note) : m.note}"
+                                  </p>
+                                </div>
                               )}
                             </div>
                           </div>
@@ -794,12 +1029,21 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
                           </div>
                         </div>
 
-                        {/* Bottom Row: Timestamp, Badge, and Undo Action */}
+                        {/* Bottom Row: Timestamp, Badge, and Actions */}
                         <div className="flex items-center justify-between pt-2 border-t border-gray-100/80 text-[11px]">
-                          <div className="flex items-center gap-1.5 text-gray-400 font-medium">
+                          <div className="flex items-center gap-1.5 text-gray-400 font-medium flex-wrap">
                             <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${badge.badgeBg}`}>
                               {badge.label}
                             </span>
+                            {m.isEdited && (
+                              <span 
+                                className="inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded text-[9px] font-bold bg-amber-50 text-amber-800 border border-amber-200/80 shrink-0"
+                                title={m.updatedAt ? `Edited on ${new Date(m.updatedAt).toLocaleString("en-IN")}` : "Edited entry"}
+                              >
+                                <Pencil className="w-2.5 h-2.5 text-amber-600" />
+                                <span>Edited</span>
+                              </span>
+                            )}
                             <span>•</span>
                             <span className="flex items-center gap-1">
                               <Clock className="w-3 h-3 text-gray-300" />
@@ -807,14 +1051,26 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
                             </span>
                           </div>
 
-                          <button
-                            type="button"
-                            onClick={() => setMovementToRevert(m)}
-                            className="inline-flex items-center gap-1 text-[11px] font-semibold text-gray-500 hover:text-rose-600 active:text-rose-700 px-2 py-1 rounded-lg hover:bg-rose-50 active:bg-rose-100 transition-colors cursor-pointer"
-                          >
-                            <RotateCcw className="w-3 h-3" />
-                            <span>Undo</span>
-                          </button>
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => handleOpenEditModal(m)}
+                              className="inline-flex items-center gap-1 text-[11px] font-semibold text-gray-500 hover:text-indigo-600 active:text-indigo-700 px-2 py-1 rounded-lg hover:bg-indigo-50 active:bg-indigo-100 transition-colors cursor-pointer"
+                              title="Edit this entry"
+                            >
+                              <Pencil className="w-3 h-3" />
+                              <span>Edit</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setMovementToRevert(m)}
+                              className="inline-flex items-center gap-1 text-[11px] font-semibold text-gray-500 hover:text-rose-600 active:text-rose-700 px-2 py-1 rounded-lg hover:bg-rose-50 active:bg-rose-100 transition-colors cursor-pointer"
+                              title="Undo this entry"
+                            >
+                              <RotateCcw className="w-3 h-3" />
+                              <span>Undo</span>
+                            </button>
+                          </div>
                         </div>
                       </div>
                     );
@@ -825,21 +1081,21 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
           </div>
 
           {/* ============================================================== */}
-          {/* 🖥️ DESKTOP VIEW: Sleek Table                                   */}
+          {/* 🖥️ 4. DESKTOP VIEW: Structured Ledger Table (hidden md:block)  */}
           {/* ============================================================== */}
           <div className="hidden md:block bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
-            <table className="w-full text-left text-sm">
-              <thead className="bg-gray-50/70 border-b border-gray-100 text-xs font-bold text-gray-500 uppercase tracking-wider">
+            <table className="w-full text-left border-collapse">
+              <thead className="bg-gray-50/70 border-b border-gray-100 text-[11px] font-bold text-gray-500 uppercase tracking-wider">
                 <tr>
-                  <th className="px-6 py-3.5">Date & Time</th>
-                  <th className="px-6 py-3.5">Product</th>
-                  <th className="px-6 py-3.5">Action Type</th>
-                  <th className="px-6 py-3.5">Channel / Platform</th>
-                  <th className="px-6 py-3.5 text-right">Quantity</th>
-                  <th className="px-6 py-3.5 text-right">Action</th>
+                  <th className="px-6 py-4">Date & Time</th>
+                  <th className="px-6 py-4">Product & Details</th>
+                  <th className="px-6 py-4">Action Type</th>
+                  <th className="px-6 py-4">Channel / Source</th>
+                  <th className="px-6 py-4 text-right">Quantity</th>
+                  <th className="px-6 py-4 text-right">Action</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-100">
+              <tbody className="divide-y divide-gray-100 text-xs">
                 {paginatedList.map((m) => {
                   const badge = getMovementBadge(m.type);
                   const Icon = badge.icon;
@@ -847,30 +1103,54 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
                   return (
                     <tr
                       key={m.id}
-                      className="hover:bg-gray-50/60 transition-colors"
+                      className="hover:bg-indigo-50/30 transition-colors group"
                     >
-                      {/* Date */}
-                      <td className="px-6 py-4 whitespace-nowrap text-xs text-gray-500">
-                        {new Date(m.date).toLocaleDateString("en-IN", {
-                          day: "2-digit",
-                          month: "short",
-                          year: "numeric",
-                          hour: "2-digit",
-                          minute: "2-digit",
-                        })}
+                      {/* Date & Time */}
+                      <td className="px-6 py-4 whitespace-nowrap text-xs">
+                        <div className="font-semibold text-gray-900">
+                          {new Date(m.date).toLocaleDateString("en-IN", {
+                            day: "2-digit",
+                            month: "short",
+                            year: "numeric",
+                          })}
+                        </div>
+                        <div className="text-[11px] text-gray-400 flex items-center gap-1 mt-0.5">
+                          <Clock className="w-3 h-3 text-gray-300" />
+                          {new Date(m.date).toLocaleTimeString("en-IN", {
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })}
+                        </div>
                       </td>
 
-                      {/* Product */}
+                      {/* Product & SKU */}
                       <td className="px-6 py-4">
-                        <div className="min-w-0">
-                          <p className="font-bold text-gray-900 hover:text-blue-600 transition-colors">
+                        <div className="min-w-0 max-w-md">
+                          <div className="flex items-center gap-1.5 flex-wrap mb-1">
+                            <span className="font-mono text-[10px] font-bold text-gray-600 bg-gray-100 px-2 py-0.5 rounded border border-gray-200/60">
+                              {m.product.sku}
+                            </span>
+                            {m.product.category && (
+                              <span className="text-[10px] text-gray-400 font-medium">
+                                • {m.product.category.name}
+                              </span>
+                            )}
+                          </div>
+                          <p className="font-bold text-gray-900 group-hover:text-indigo-600 transition-colors line-clamp-1">
                             {m.product.name}
                           </p>
-                          <p className="text-xs text-gray-500 font-mono mt-0.5">
-                            SKU: {m.product.sku} {m.product.category && `• ${m.product.category.name}`}
-                          </p>
                           {m.note && (
-                            <p className="text-xs text-gray-400 italic mt-0.5">"{m.note}"</p>
+                            <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+                              {m.note.includes("Given To:") && (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200/60">
+                                  <User className="w-3 h-3 text-indigo-600" />
+                                  Given To: {m.note.split("|")[0].replace("Given To:", "").trim()}
+                                </span>
+                              )}
+                              <p className="text-[11px] text-gray-500 italic line-clamp-1">
+                                "{m.note.includes("Given To:") ? (m.note.split("|").slice(1).join(" | ").trim() || m.note) : m.note}"
+                              </p>
+                            </div>
                           )}
                         </div>
                       </td>
@@ -878,49 +1158,77 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
                       {/* Action Type Badge */}
                       <td className="px-6 py-4">
                         <div className="flex flex-wrap items-center gap-1.5">
-                          <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border ${badge.badgeBg}`}>
+                          <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-xs font-semibold border ${badge.badgeBg}`}>
                             <Icon className="w-3.5 h-3.5" />
                             {badge.label}
                           </span>
 
+                          {m.isEdited && (
+                            <span 
+                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-bold bg-amber-50 text-amber-800 border border-amber-200/80"
+                              title={m.updatedAt ? `Edited on ${new Date(m.updatedAt).toLocaleString("en-IN")}` : "Edited entry"}
+                            >
+                              <Pencil className="w-2.5 h-2.5 text-amber-600" />
+                              <span>Edited</span>
+                            </span>
+                          )}
+
                           {m.unitCost && m.unitCost > 0 && (
-                            <span className="text-xs font-bold text-blue-700 bg-blue-50 px-2 py-1 rounded-lg border border-blue-100">
-                              @ ₹{m.unitCost}/unit
+                            <span className="text-xs font-bold text-indigo-700 bg-indigo-50 px-2 py-1 rounded-xl border border-indigo-100">
+                              @ ₹{m.unitCost}
                             </span>
                           )}
                         </div>
                       </td>
 
                       {/* Channel */}
-                      <td className="px-6 py-4 whitespace-nowrap text-xs text-gray-600 font-medium">
+                      <td className="px-6 py-4 whitespace-nowrap text-xs">
                         {m.platform ? (
-                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-indigo-50 text-indigo-700 border border-indigo-100 font-semibold">
-                            <Store className="w-3 h-3" />
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-indigo-50 text-indigo-700 border border-indigo-100 font-semibold">
+                            <Store className="w-3.5 h-3.5" />
                             {m.platform.name}
                           </span>
+                        ) : m.note?.includes("Given To:") ? (
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-emerald-50 text-emerald-700 border border-emerald-200/60 font-semibold text-[11px]">
+                            <Handshake className="w-3.5 h-3.5" />
+                            Direct Handover
+                          </span>
                         ) : (
-                          <span className="text-gray-400">Manual Entry</span>
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-xl bg-gray-50 text-gray-500 border border-gray-150 font-medium">
+                            Manual Entry
+                          </span>
                         )}
                       </td>
 
                       {/* Quantity */}
                       <td className="px-6 py-4 whitespace-nowrap text-right">
-                        <span className={`font-mono font-bold text-sm px-2.5 py-1 rounded-lg border ${badge.badgeBg}`}>
-                          {badge.prefix}{m.quantity}
+                        <span className={`inline-block font-mono font-bold text-xs px-2.5 py-1 rounded-xl border ${badge.badgeBg}`}>
+                          {badge.prefix}{m.quantity} pcs
                         </span>
                       </td>
 
-                      {/* Undo Action */}
+                      {/* Actions */}
                       <td className="px-6 py-4 whitespace-nowrap text-right">
-                        <button
-                          type="button"
-                          onClick={() => setMovementToRevert(m)}
-                          className="px-2.5 py-1 text-xs font-semibold text-rose-600 bg-rose-50 hover:bg-rose-100 active:bg-rose-200 border border-rose-200/60 rounded-lg transition-colors cursor-pointer inline-flex items-center gap-1"
-                          title="Undo / Delete this entry"
-                        >
-                          <RotateCcw className="w-3.5 h-3.5" />
-                          <span>Undo</span>
-                        </button>
+                        <div className="flex items-center justify-end gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => handleOpenEditModal(m)}
+                            className="px-2.5 py-1.5 text-xs font-semibold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 active:bg-indigo-200 border border-indigo-200/60 rounded-xl transition-all cursor-pointer inline-flex items-center gap-1.5 active:scale-95 shadow-xs"
+                            title="Edit this entry"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                            <span>Edit</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setMovementToRevert(m)}
+                            className="px-2.5 py-1.5 text-xs font-semibold text-rose-600 bg-rose-50 hover:bg-rose-100 active:bg-rose-200 border border-rose-200/60 rounded-xl transition-all cursor-pointer inline-flex items-center gap-1.5 active:scale-95 shadow-xs"
+                            title="Undo / Delete this entry"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            <span>Undo</span>
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );
@@ -1259,6 +1567,200 @@ export function MovementsClient({ initialMovements, platforms = [] }: MovementsC
                   <>
                     <RotateCcw className="w-3.5 h-3.5" />
                     Yes, Revert Entry
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ============================================================== */}
+      {/* ✏️ MODAL 4: Edit Stock Movement Entry Modal                    */}
+      {/* ============================================================== */}
+      {movementToEdit && (
+        <div className="fixed inset-0 z-[130] bg-black/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4">
+          <div 
+            className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-3xl p-5 sm:p-6 shadow-2xl border border-gray-100 space-y-4 max-h-[90vh] overflow-y-auto animate-in slide-in-from-bottom sm:zoom-in-95 duration-200"
+          >
+            {/* Header */}
+            <div className="flex items-start justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-indigo-50 text-indigo-600 flex items-center justify-center font-bold">
+                  <Pencil className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-base text-gray-900">Edit Stock Entry</h3>
+                  <p className="text-xs text-gray-500">Update quantity, recipient, rate, or notes</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => !isUpdating && setMovementToEdit(null)}
+                className="p-1.5 text-gray-400 hover:text-gray-600 rounded-full cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Product & Entry Context Card */}
+            <div className="bg-gray-50 p-3.5 rounded-2xl border border-gray-100 space-y-1.5 text-xs">
+              <div className="flex justify-between items-center">
+                <span className="text-gray-500">Product:</span>
+                <span className="font-bold text-gray-900 text-right truncate max-w-[220px]">
+                  {movementToEdit.product.name}
+                </span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-gray-500">SKU:</span>
+                <span className="font-mono font-semibold text-gray-700">
+                  {movementToEdit.product.sku}
+                </span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-gray-500">Transaction Type:</span>
+                <span className="font-bold text-gray-800 flex items-center gap-1">
+                  {getMovementBadge(movementToEdit.type).label}
+                </span>
+              </div>
+            </div>
+
+            {/* Error Banner */}
+            {updateError && (
+              <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-700 flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                <span>{updateError}</span>
+              </div>
+            )}
+
+            {/* Edit Form */}
+            <div className="space-y-3 text-xs">
+              {/* Quantity */}
+              <div>
+                <label className="block text-xs font-bold text-gray-700 mb-1">
+                  Quantity (Pcs) <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  type="number"
+                  min="1"
+                  value={editFormData.quantity}
+                  onChange={(e) => setEditFormData(prev => ({ ...prev, quantity: e.target.value }))}
+                  placeholder="Enter quantity..."
+                  className="w-full text-sm font-semibold bg-gray-50 border border-gray-200 rounded-xl p-2.5 outline-none focus:border-indigo-500 focus:bg-white transition-all"
+                />
+                {/* Live delta helper */}
+                {editFormData.quantity && Number(editFormData.quantity) !== movementToEdit.quantity && (
+                  <p className="text-[11px] text-indigo-600 font-medium mt-1">
+                    Original: {movementToEdit.quantity} pcs → New: {editFormData.quantity} pcs ({Number(editFormData.quantity) - movementToEdit.quantity > 0 ? `+${Number(editFormData.quantity) - movementToEdit.quantity}` : `${Number(editFormData.quantity) - movementToEdit.quantity}`} pcs change)
+                  </p>
+                )}
+              </div>
+
+              {/* If Stock IN: Purchase Rate */}
+              {movementToEdit.type === "IN" && (
+                <div>
+                  <label className="block text-xs font-bold text-gray-700 mb-1">
+                    Purchase Rate (₹/pc)
+                  </label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={editFormData.unitCost}
+                    onChange={(e) => setEditFormData(prev => ({ ...prev, unitCost: e.target.value }))}
+                    placeholder="Enter cost per unit..."
+                    className="w-full text-sm font-semibold bg-gray-50 border border-gray-200 rounded-xl p-2.5 outline-none focus:border-indigo-500 focus:bg-white transition-all"
+                  />
+                  <p className="text-[10px] text-gray-400 mt-1">
+                    Is rate ko update karne par product ki average purchase cost automatically recalculate ho jayegi.
+                  </p>
+                </div>
+              )}
+
+              {/* Given To (Person Name) */}
+              <div>
+                <label className="block text-xs font-bold text-gray-700 mb-1">
+                  Given To / Recipient (Optional)
+                </label>
+                <input
+                  type="text"
+                  value={editFormData.recipientName}
+                  onChange={(e) => setEditFormData(prev => ({ ...prev, recipientName: e.target.value }))}
+                  placeholder="Person or party name (e.g. Ramesh, Local Client)..."
+                  className="w-full text-xs bg-gray-50 border border-gray-200 rounded-xl p-2.5 outline-none focus:border-indigo-500 focus:bg-white transition-all"
+                />
+              </div>
+
+              {/* Channel / Platform */}
+              <div>
+                <label className="block text-xs font-bold text-gray-700 mb-1">
+                  Channel / Source
+                </label>
+                <select
+                  value={editFormData.platformId}
+                  onChange={(e) => setEditFormData(prev => ({ ...prev, platformId: e.target.value }))}
+                  className="w-full text-xs font-medium bg-gray-50 border border-gray-200 rounded-xl p-2.5 outline-none focus:border-indigo-500 focus:bg-white transition-all cursor-pointer"
+                >
+                  <option value="MANUAL">Manual / Direct Handover</option>
+                  {platforms.map((p) => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Extra Notes */}
+              <div>
+                <label className="block text-xs font-bold text-gray-700 mb-1">
+                  Notes / Remarks (Optional)
+                </label>
+                <textarea
+                  rows={2}
+                  value={editFormData.note}
+                  onChange={(e) => setEditFormData(prev => ({ ...prev, note: e.target.value }))}
+                  placeholder="Reason, invoice number, or additional note..."
+                  className="w-full text-xs bg-gray-50 border border-gray-200 rounded-xl p-2.5 outline-none focus:border-indigo-500 focus:bg-white transition-all resize-none"
+                />
+              </div>
+
+              {/* Date & Time */}
+              <div>
+                <label className="block text-xs font-bold text-gray-700 mb-1">
+                  Entry Date & Time
+                </label>
+                <input
+                  type="datetime-local"
+                  value={editFormData.date}
+                  onChange={(e) => setEditFormData(prev => ({ ...prev, date: e.target.value }))}
+                  className="w-full text-xs bg-gray-50 border border-gray-200 rounded-xl p-2.5 outline-none focus:border-indigo-500 focus:bg-white transition-all"
+                />
+              </div>
+            </div>
+
+            {/* Action Buttons */}
+            <div className="flex items-center gap-2.5 pt-2">
+              <button
+                type="button"
+                disabled={isUpdating}
+                onClick={() => setMovementToEdit(null)}
+                className="flex-1 py-2.5 text-xs font-semibold text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-xl transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isUpdating}
+                onClick={handleSaveMovementEdit}
+                className="flex-1 py-2.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 rounded-xl transition-colors shadow-sm shadow-indigo-600/30 flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                {isUpdating ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    Updating...
+                  </>
+                ) : (
+                  <>
+                    <Check className="w-3.5 h-3.5" />
+                    Save Changes
                   </>
                 )}
               </button>

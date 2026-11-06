@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
+import { createPortal } from "react-dom";
 import {
   X,
   UploadCloud,
@@ -19,27 +20,54 @@ import {
   Check,
   Calendar,
   RotateCcw,
+  FileText,
+  Search,
+  ShieldAlert,
 } from "lucide-react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
+
+interface AvailableProduct {
+  id: string;
+  name: string;
+  sku: string;
+  currentStock: number;
+}
 
 interface SkuSummaryItem {
   sku: string;
   name: string;
   totalQuantity: number;
+  duplicateQuantity?: number;
   currentStock: number;
   afterStock: number;
   productId: string | null;
+  found: boolean;
+  isSubstituted?: boolean;
+  originalSku?: string;
+}
+
+interface SubstitutedFromSnapshot {
+  sku: string;
+  originalSku?: string;
+  description?: string;
+  productId: string | null;
+  productName: string;
+  currentStock: number | null;
   found: boolean;
 }
 
 interface ParsedOrderItem {
   sku: string;
+  originalSku?: string;
   description: string;
   quantity: number;
   productId: string | null;
   productName: string;
   currentStock: number | null;
   found: boolean;
+  isSubstituted?: boolean;
+  substitutedFrom?: SubstitutedFromSnapshot;
 }
 
 interface ParsedOrder {
@@ -54,6 +82,9 @@ interface ParsedOrder {
   hasMissingSku?: boolean;
   missingSkuError?: string;
   items: ParsedOrderItem[];
+  isAlreadyDispatched?: boolean;
+  dispatchedAt?: string | null;
+  duplicateBatchFileName?: string | null;
 }
 
 interface ParsedData {
@@ -63,8 +94,11 @@ interface ParsedData {
   totalUnits: number;
   allSkusFound: boolean;
   unreadOrdersCount?: number;
+  duplicateOrdersCount?: number;
+  allOrdersDuplicate?: boolean;
   skuSummary: SkuSummaryItem[];
   orders: ParsedOrder[];
+  availableProducts?: AvailableProduct[];
 }
 
 interface BulkDispatchModalProps {
@@ -80,6 +114,7 @@ export function BulkDispatchModal({
 }: BulkDispatchModalProps) {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const [step, setStep] = useState<"UPLOAD" | "PARSING" | "PREVIEW" | "CONFIRMING" | "SUCCESS">("UPLOAD");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -94,10 +129,45 @@ export function BulkDispatchModal({
     units: number;
     channel: string;
   } | null>(null);
+  const [substitutingSku, setSubstitutingSku] = useState<string | null>(null);
+  const [selectedSubProduct, setSelectedSubProduct] = useState<Record<string, string>>({});
+  const [editingItemSwapKey, setEditingItemSwapKey] = useState<string | null>(null);
 
-  if (!isOpen) return null;
+  // Custom "Coding-Wala" Native Bottom-Sheet SKU Picker State
+  const [mounted, setMounted] = useState(false);
+  const [skuPicker, setSkuPicker] = useState<{
+    isOpen: boolean;
+    type: "BATCH" | "SINGLE";
+    fromSku: string;
+    orderIdx?: number;
+    itemIdx?: number;
+    selectedProductId: string;
+  } | null>(null);
+  const [skuSearchQuery, setSkuSearchQuery] = useState("");
+  const [filterOnlyInStock, setFilterOnlyInStock] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  useEffect(() => {
+    if (skuPicker?.isOpen) {
+      document.body.style.overflow = "hidden";
+    } else if (isOpen) {
+      document.body.style.overflow = "hidden";
+    } else {
+      document.body.style.overflow = "unset";
+    }
+    return () => {
+      document.body.style.overflow = "unset";
+    };
+  }, [skuPicker?.isOpen, isOpen]);
 
   const resetState = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
     setStep("UPLOAD");
     setSelectedFile(null);
     setParsedData(null);
@@ -107,6 +177,316 @@ export function BulkDispatchModal({
     setUsePdfDate(true);
     setCopiedAwb(null);
     setSuccessInfo(null);
+    setSubstitutingSku(null);
+    setSelectedSubProduct({});
+    setEditingItemSwapKey(null);
+    setSkuPicker(null);
+    setSkuSearchQuery("");
+    setFilterOnlyInStock(false);
+  };
+
+  const pickerAvailableProducts = useMemo(() => {
+    if (!parsedData?.availableProducts || !skuPicker?.isOpen) return [];
+    const fromSkuLower = (skuPicker.fromSku || "").toLowerCase().trim();
+    const q = skuSearchQuery.toLowerCase().trim();
+
+    return parsedData.availableProducts.filter((p) => {
+      // Exclude the current SKU
+      if (p.sku.toLowerCase().trim() === fromSkuLower) return false;
+
+      // Filter only in stock if toggled
+      if (filterOnlyInStock && p.currentStock <= 0) return false;
+
+      // Search match
+      if (!q) return true;
+      return (
+        p.sku.toLowerCase().includes(q) ||
+        p.name.toLowerCase().includes(q)
+      );
+    });
+  }, [parsedData?.availableProducts, skuPicker, skuSearchQuery, filterOnlyInStock]);
+
+  if (!isOpen) return null;
+
+  const recalculateSummary = (
+    orders: ParsedOrder[],
+    availableProducts: AvailableProduct[] = []
+  ): SkuSummaryItem[] => {
+    const prodMap = new Map(availableProducts.map((p) => [p.id, p]));
+    const summaryMap = new Map<string, SkuSummaryItem>();
+
+    for (const ord of orders) {
+      for (const it of ord.items) {
+        const prod = it.productId ? prodMap.get(it.productId) : null;
+        const skuKey = it.sku;
+        const current = summaryMap.get(skuKey) || {
+          sku: skuKey,
+          name: it.productName || prod?.name || skuKey,
+          totalQuantity: 0,
+          duplicateQuantity: 0,
+          currentStock: prod?.currentStock ?? (it.currentStock ?? 0),
+          afterStock: prod?.currentStock ?? (it.currentStock ?? 0),
+          productId: it.productId,
+          found: it.found,
+          isSubstituted: it.isSubstituted,
+          originalSku: it.originalSku,
+        };
+
+        if (ord.isAlreadyDispatched) {
+          current.duplicateQuantity = (current.duplicateQuantity || 0) + it.quantity;
+        } else {
+          current.totalQuantity += it.quantity;
+          current.afterStock = current.currentStock - current.totalQuantity;
+        }
+
+        if (it.isSubstituted) {
+          current.isSubstituted = true;
+          current.originalSku = it.originalSku;
+        }
+        summaryMap.set(skuKey, current);
+      }
+    }
+
+    return Array.from(summaryMap.values());
+  };
+
+  const handleSubstituteBatch = (fromSku: string, targetProductId: string) => {
+    if (!parsedData || !targetProductId) return;
+    const targetProduct = parsedData.availableProducts?.find((p) => p.id === targetProductId);
+    if (!targetProduct) return;
+
+    const updatedOrders = parsedData.orders.map((ord) => ({
+      ...ord,
+      items: ord.items.map((it) => {
+        const matches =
+          it.sku.toLowerCase().trim() === fromSku.toLowerCase().trim() ||
+          (it.originalSku && it.originalSku.toLowerCase().trim() === fromSku.toLowerCase().trim());
+        if (!matches) return it;
+
+        const snapshot: SubstitutedFromSnapshot = it.substitutedFrom || {
+          sku: it.sku,
+          originalSku: it.originalSku,
+          description: it.description,
+          productId: it.productId,
+          productName: it.productName,
+          currentStock: it.currentStock,
+          found: it.found,
+        };
+
+        return {
+          ...it,
+          substitutedFrom: snapshot,
+          originalSku: it.originalSku || it.sku,
+          sku: targetProduct.sku,
+          productId: targetProduct.id,
+          productName: targetProduct.name,
+          currentStock: targetProduct.currentStock,
+          found: true,
+          isSubstituted: true,
+        };
+      }),
+    }));
+
+    const newSkuSummary = recalculateSummary(updatedOrders, parsedData.availableProducts);
+    const unreadCount = updatedOrders.filter((o) => o.items.length === 0).length;
+    const dupCount = updatedOrders.filter((o) => o.isAlreadyDispatched).length;
+    const allDup = dupCount === updatedOrders.length && updatedOrders.length > 0;
+    const allFound =
+      newSkuSummary.length > 0 &&
+      newSkuSummary.every((s) => s.found) &&
+      unreadCount === 0;
+
+    setParsedData({
+      ...parsedData,
+      orders: updatedOrders,
+      skuSummary: newSkuSummary,
+      allSkusFound: allFound,
+      duplicateOrdersCount: dupCount,
+      allOrdersDuplicate: allDup,
+    });
+    setSubstitutingSku(null);
+  };
+
+  const handleRevertBatchSubstitute = (currentSku: string) => {
+    if (!parsedData) return;
+
+    const updatedOrders = parsedData.orders.map((ord) => ({
+      ...ord,
+      items: ord.items.map((it) => {
+        if (!it.isSubstituted) return it;
+        if (it.sku.toLowerCase().trim() !== currentSku.toLowerCase().trim()) return it;
+
+        if (it.substitutedFrom) {
+          const from = it.substitutedFrom;
+          return {
+            ...it,
+            sku: from.sku,
+            originalSku: from.originalSku,
+            productId: from.productId,
+            productName: from.productName,
+            currentStock: from.currentStock,
+            found: from.found,
+            isSubstituted: false,
+            substitutedFrom: undefined,
+          };
+        }
+
+        const origProd = parsedData.availableProducts?.find(
+          (p) => p.sku.toLowerCase().trim() === it.originalSku?.toLowerCase().trim()
+        );
+
+        return {
+          ...it,
+          sku: it.originalSku || it.sku,
+          originalSku: undefined,
+          productId: origProd?.id || null,
+          productName: origProd?.name || it.description,
+          currentStock: origProd ? origProd.currentStock : null,
+          found: !!origProd,
+          isSubstituted: false,
+        };
+      }),
+    }));
+
+    const newSkuSummary = recalculateSummary(updatedOrders, parsedData.availableProducts);
+    const unreadCount = updatedOrders.filter((o) => o.items.length === 0).length;
+    const dupCount = updatedOrders.filter((o) => o.isAlreadyDispatched).length;
+    const allDup = dupCount === updatedOrders.length && updatedOrders.length > 0;
+    const allFound =
+      newSkuSummary.length > 0 &&
+      newSkuSummary.every((s) => s.found) &&
+      unreadCount === 0;
+
+    setParsedData({
+      ...parsedData,
+      orders: updatedOrders,
+      skuSummary: newSkuSummary,
+      allSkusFound: allFound,
+      duplicateOrdersCount: dupCount,
+      allOrdersDuplicate: allDup,
+    });
+  };
+
+  const handleSubstituteSingleItem = (
+    orderIdx: number,
+    itemIdx: number,
+    targetProductId: string
+  ) => {
+    if (!parsedData || !targetProductId) return;
+    const targetProduct = parsedData.availableProducts?.find((p) => p.id === targetProductId);
+    if (!targetProduct) return;
+
+    const updatedOrders = [...parsedData.orders];
+    const targetOrder = { ...updatedOrders[orderIdx] };
+    const targetItems = [...targetOrder.items];
+    const currentItem = targetItems[itemIdx];
+
+    const snapshot: SubstitutedFromSnapshot = currentItem.substitutedFrom || {
+      sku: currentItem.sku,
+      originalSku: currentItem.originalSku,
+      description: currentItem.description,
+      productId: currentItem.productId,
+      productName: currentItem.productName,
+      currentStock: currentItem.currentStock,
+      found: currentItem.found,
+    };
+
+    targetItems[itemIdx] = {
+      ...currentItem,
+      substitutedFrom: snapshot,
+      originalSku: currentItem.originalSku || currentItem.sku,
+      sku: targetProduct.sku,
+      productId: targetProduct.id,
+      productName: targetProduct.name,
+      currentStock: targetProduct.currentStock,
+      found: true,
+      isSubstituted: true,
+    };
+
+    targetOrder.items = targetItems;
+    updatedOrders[orderIdx] = targetOrder;
+
+    const newSkuSummary = recalculateSummary(updatedOrders, parsedData.availableProducts);
+    const unreadCount = updatedOrders.filter((o) => o.items.length === 0).length;
+    const dupCount = updatedOrders.filter((o) => o.isAlreadyDispatched).length;
+    const allDup = dupCount === updatedOrders.length && updatedOrders.length > 0;
+    const allFound =
+      newSkuSummary.length > 0 &&
+      newSkuSummary.every((s) => s.found) &&
+      unreadCount === 0;
+
+    setParsedData({
+      ...parsedData,
+      orders: updatedOrders,
+      skuSummary: newSkuSummary,
+      allSkusFound: allFound,
+      duplicateOrdersCount: dupCount,
+      allOrdersDuplicate: allDup,
+    });
+    setEditingItemSwapKey(null);
+  };
+
+  const handleRevertSingleItem = (orderIdx: number, itemIdx: number) => {
+    if (!parsedData) return;
+
+    const updatedOrders = [...parsedData.orders];
+    const targetOrder = { ...updatedOrders[orderIdx] };
+    const targetItems = [...targetOrder.items];
+    const currentItem = targetItems[itemIdx];
+
+    if (!currentItem.isSubstituted) return;
+
+    if (currentItem.substitutedFrom) {
+      const from = currentItem.substitutedFrom;
+      targetItems[itemIdx] = {
+        ...currentItem,
+        sku: from.sku,
+        originalSku: from.originalSku,
+        productId: from.productId,
+        productName: from.productName,
+        currentStock: from.currentStock,
+        found: from.found,
+        isSubstituted: false,
+        substitutedFrom: undefined,
+      };
+    } else {
+      const origProd = parsedData.availableProducts?.find(
+        (p) => p.sku.toLowerCase().trim() === currentItem.originalSku?.toLowerCase().trim()
+      );
+
+      targetItems[itemIdx] = {
+        ...currentItem,
+        sku: currentItem.originalSku || currentItem.sku,
+        originalSku: undefined,
+        productId: origProd?.id || null,
+        productName: origProd?.name || currentItem.description,
+        currentStock: origProd ? origProd.currentStock : null,
+        found: !!origProd,
+        isSubstituted: false,
+      };
+    }
+
+    targetOrder.items = targetItems;
+    updatedOrders[orderIdx] = targetOrder;
+
+    const newSkuSummary = recalculateSummary(updatedOrders, parsedData.availableProducts);
+    const unreadCount = updatedOrders.filter((o) => o.items.length === 0).length;
+    const dupCount = updatedOrders.filter((o) => o.isAlreadyDispatched).length;
+    const allDup = dupCount === updatedOrders.length && updatedOrders.length > 0;
+    const allFound =
+      newSkuSummary.length > 0 &&
+      newSkuSummary.every((s) => s.found) &&
+      unreadCount === 0;
+
+    setParsedData({
+      ...parsedData,
+      orders: updatedOrders,
+      skuSummary: newSkuSummary,
+      allSkusFound: allFound,
+      duplicateOrdersCount: dupCount,
+      allOrdersDuplicate: allDup,
+    });
+    setEditingItemSwapKey(null);
   };
 
   const handleClose = () => {
@@ -148,11 +528,17 @@ export function BulkDispatchModal({
     const formData = new FormData();
     formData.append("file", file);
 
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    const timeoutId = setTimeout(() => controller.abort(), 60000);
+
     try {
       const res = await fetch("/api/dispatch/parse", {
         method: "POST",
         body: formData,
+        signal: controller.signal,
       });
+      clearTimeout(timeoutId);
 
       const json = await res.json();
 
@@ -163,8 +549,13 @@ export function BulkDispatchModal({
       setParsedData(json.data);
       setStep("PREVIEW");
     } catch (err: any) {
+      clearTimeout(timeoutId);
       console.error(err);
-      setErrorMessage(err.message || "Error parsing PDF. Please verify it is a valid Flipkart, Meesho or Amazon label.");
+      if (err.name === "AbortError") {
+        setErrorMessage("File reading took longer than expected. Please try again or upload a smaller file.");
+      } else {
+        setErrorMessage(err.message || "Error parsing PDF. Please verify it is a valid Flipkart, Meesho or Amazon label.");
+      }
       setStep("UPLOAD");
     }
   };
@@ -180,6 +571,11 @@ export function BulkDispatchModal({
   const handleConfirmDispatch = async () => {
     if (!parsedData || parsedData.orders.length === 0) return;
 
+    if (allOrdersDuplicate) {
+      setErrorMessage("Cannot dispatch: Is file ke sabhi orders pehle hi dispatch ho chuke hain.");
+      return;
+    }
+
     // Strict validation safety: prevent dispatch if any SKU missing
     const missingSkus = parsedData.skuSummary.filter((s) => !s.found);
     if (missingSkus.length > 0) {
@@ -190,6 +586,13 @@ export function BulkDispatchModal({
     setStep("CONFIRMING");
     setErrorMessage(null);
 
+    // Calculate courier partner summary breakdown
+    const courierCounts: Record<string, number> = {};
+    for (const ord of parsedData.orders) {
+      const cName = ord.courier?.trim() || "Standard / Unspecified";
+      courierCounts[cName] = (courierCounts[cName] || 0) + 1;
+    }
+
     try {
       const res = await fetch("/api/dispatch/confirm", {
         method: "POST",
@@ -198,6 +601,9 @@ export function BulkDispatchModal({
           channel: parsedData.channel,
           orders: parsedData.orders,
           usePdfDate,
+          fileName: selectedFile?.name || `${parsedData.channelLabel}_Dispatch_${new Date().toISOString().slice(0, 10)}.pdf`,
+          skuSummary: parsedData.skuSummary,
+          courierSummary: courierCounts,
         }),
       });
 
@@ -227,11 +633,19 @@ export function BulkDispatchModal({
   const isFlipkart = parsedData?.channel === "FLIPKART";
   const isOther = parsedData?.channel === "OTHER";
 
+  const duplicateOrders = parsedData ? parsedData.orders.filter((o) => o.isAlreadyDispatched) : [];
+  const duplicateOrdersCount = parsedData?.duplicateOrdersCount ?? duplicateOrders.length;
+  const allOrdersDuplicate =
+    parsedData?.allOrdersDuplicate ??
+    (duplicateOrdersCount === (parsedData?.totalOrders ?? 0) && (parsedData?.totalOrders ?? 0) > 0);
+  const hasDuplicateOrders = duplicateOrdersCount > 0;
+
   const missingSkus = parsedData ? parsedData.skuSummary.filter((s) => !s.found) : [];
   const unreadOrders = parsedData ? parsedData.orders.filter((o) => o.items.length === 0) : [];
   const hasUnreadSkus = unreadOrders.length > 0 || (parsedData?.unreadOrdersCount ?? 0) > 0;
   const isZeroUnits = parsedData ? parsedData.totalUnits === 0 : false;
-  const hasMissingSkus = missingSkus.length > 0 || hasUnreadSkus || isZeroUnits;
+  const hasMissingSkus =
+    !allOrdersDuplicate && (missingSkus.length > 0 || hasUnreadSkus || isZeroUnits);
 
   return (
     <div className="fixed inset-0 z-[120] flex items-end sm:items-center justify-center p-0 sm:p-4">
@@ -418,11 +832,25 @@ export function BulkDispatchModal({
                 </p>
               </div>
 
-              {selectedFile && (
-                <span className="text-xs font-mono font-medium text-indigo-700 bg-indigo-50 px-3 py-1 rounded-xl">
-                  {selectedFile.name}
-                </span>
-              )}
+              <div className="flex flex-col items-center gap-2">
+                {selectedFile && (
+                  <span className="text-xs font-mono font-medium text-indigo-700 bg-indigo-50 px-3 py-1 rounded-xl">
+                    {selectedFile.name}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (abortControllerRef.current) {
+                      abortControllerRef.current.abort();
+                    }
+                    resetState();
+                  }}
+                  className="text-xs text-gray-500 hover:text-rose-600 underline transition-colors cursor-pointer mt-1"
+                >
+                  Cancel Scanning
+                </button>
+              </div>
             </div>
           )}
 
@@ -466,6 +894,43 @@ export function BulkDispatchModal({
                 </div>
               </div>
 
+              {/* Duplicate Orders Alert Banner */}
+              {allOrdersDuplicate ? (
+                <div className="p-3.5 sm:p-4 rounded-2xl bg-amber-50/90 border border-amber-200/90 text-amber-950 text-xs space-y-1.5 animate-in fade-in">
+                  <div className="flex items-center gap-2 font-bold text-amber-900 text-sm">
+                    <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0" />
+                    Duplicate File Alert: Yeh Sabhi Orders Pehle Hi Dispatch Ho Chuke Hain!
+                  </div>
+                  <p className="text-[11px] sm:text-xs text-amber-800 leading-relaxed">
+                    Is file ke sabhi ({parsedData.totalOrders}) orders already dispatch ho chuke hain (Pechela batch:{" "}
+                    <strong>
+                      {parsedData.orders.find((o) => o.dispatchedAt)?.dispatchedAt
+                        ? new Date(
+                            parsedData.orders.find((o) => o.dispatchedAt)!.dispatchedAt!
+                          ).toLocaleString("en-IN", {
+                            day: "2-digit",
+                            month: "short",
+                            year: "numeric",
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })
+                        : "Earlier"}
+                    </strong>
+                    ). Double stock cut se bachne ke liye Confirm button block kar diya gaya hai.
+                  </p>
+                </div>
+              ) : hasDuplicateOrders ? (
+                <div className="p-3.5 rounded-2xl bg-amber-50/90 border border-amber-200/80 text-amber-950 text-xs space-y-1 animate-in fade-in">
+                  <div className="flex items-center gap-2 font-bold text-amber-900">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                    {duplicateOrdersCount} Duplicate Order(s) Detected (No Double Deduction)
+                  </div>
+                  <p className="text-[11px] text-amber-800 leading-relaxed">
+                    In {duplicateOrdersCount} order(s) ka stock pehle hi cut ho chuka hai. Inka double stock cut nahi hoga, sirf baaki naye orders dispatch honge.
+                  </p>
+                </div>
+              ) : null}
+
               {/* Missing SKU Blocked Banner - Soft Warning */}
               {missingSkus.length > 0 && (
                 <div className="p-3.5 rounded-2xl bg-rose-50 text-rose-800 text-xs space-y-1 animate-in fade-in">
@@ -499,7 +964,11 @@ export function BulkDispatchModal({
                   <h4 className="text-xs font-bold text-gray-700 uppercase tracking-wider">
                     SKU Stock Impact ({parsedData.skuSummary.length})
                   </h4>
-                  {isZeroUnits || parsedData.skuSummary.length === 0 ? (
+                  {allOrdersDuplicate ? (
+                    <span className="text-[11px] font-bold text-amber-900 bg-amber-100/90 border border-amber-200/80 px-2 py-0.5 rounded-lg flex items-center gap-1">
+                      <ShieldAlert className="w-3 h-3 text-amber-600" /> All Orders Already Dispatched
+                    </span>
+                  ) : isZeroUnits || parsedData.skuSummary.length === 0 ? (
                     <span className="text-[11px] font-bold text-amber-800 bg-amber-50 px-2 py-0.5 rounded-lg flex items-center gap-1">
                       <AlertTriangle className="w-3 h-3 text-amber-600" /> 0 Units Detected
                     </span>
@@ -522,31 +991,166 @@ export function BulkDispatchModal({
                   {parsedData.skuSummary.map((item) => (
                     <div
                       key={item.sku}
-                      className="p-3 rounded-xl bg-white flex items-center justify-between gap-3 text-xs shadow-2xs"
+                      className="p-3 rounded-xl bg-white flex flex-col gap-2 text-xs shadow-2xs"
                     >
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-1.5 flex-wrap">
-                          <span className="font-mono font-bold text-gray-900 bg-gray-100 px-2 py-0.5 rounded-md text-xs">
-                            {item.sku}
-                          </span>
-                          {!item.found && (
-                            <span className="text-[10px] font-bold text-rose-700 bg-rose-100/70 px-2 py-0.5 rounded-md">
-                              Not in Inventory
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="font-mono font-bold text-gray-900 bg-gray-100 px-2 py-0.5 rounded-md text-xs">
+                              {item.sku}
                             </span>
+                            {item.isSubstituted && (
+                              <span className="text-[10px] font-bold text-purple-800 bg-purple-100 px-2 py-0.5 rounded-md border border-purple-200">
+                                🔄 Substituted (Label: {item.originalSku})
+                              </span>
+                            )}
+                            {!item.found && (
+                              <span className="text-[10px] font-bold text-rose-700 bg-rose-100/70 px-2 py-0.5 rounded-md">
+                                Not in Inventory
+                              </span>
+                            )}
+                            {item.found && (item.currentStock <= 0 || item.afterStock < 0) && (
+                              <span className="text-[10px] font-bold text-amber-800 bg-amber-100/80 px-2 py-0.5 rounded-md flex items-center gap-1">
+                                ⚠️ Stock Low / 0
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="text-right shrink-0">
+                          <span className="text-rose-600 font-bold">
+                            -{item.totalQuantity} units
+                          </span>
+                          {item.found && (
+                            <p className="text-[10px] text-gray-400 mt-0.5">
+                              Stock: {item.currentStock} →{" "}
+                              <strong
+                                className={
+                                  item.afterStock < 0 ? "text-rose-600 font-bold" : "text-gray-700"
+                                }
+                              >
+                                {item.afterStock}
+                              </strong>
+                            </p>
                           )}
                         </div>
                       </div>
 
-                      <div className="text-right shrink-0">
-                        <span className="text-rose-600 font-bold">
-                          -{item.totalQuantity} units
-                        </span>
-                        {item.found && (
-                          <p className="text-[10px] text-gray-400 mt-0.5">
-                            Stock: {item.currentStock} → <strong className="text-gray-700">{item.afterStock}</strong>
-                          </p>
+                      {/* Swap Action Bar */}
+                      <div className="flex items-center justify-between pt-1 border-t border-gray-100/80 text-[11px]">
+                        {item.isSubstituted ? (
+                          <div className="flex items-center justify-between w-full">
+                            <span className="text-purple-800 text-[10px] font-medium">
+                              Swapped with {item.name}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleRevertBatchSubstitute(item.sku)}
+                              className="text-[10px] font-bold text-purple-700 hover:text-purple-900 underline cursor-pointer"
+                            >
+                              Undo Swap
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="flex items-center justify-between w-full">
+                            <span className="text-gray-400 text-[10px]">
+                              {item.currentStock <= 0 || item.afterStock < 0
+                                ? "Out of stock? Upgrade or substitute variant:"
+                                : "Want to ship another variant?"}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setSubstitutingSku(substitutingSku === item.sku ? null : item.sku)
+                              }
+                              className="text-[10px] font-bold text-indigo-600 hover:text-indigo-800 hover:bg-indigo-50 px-2 py-0.5 rounded-md flex items-center gap-1 cursor-pointer transition-colors"
+                            >
+                              <RotateCcw className="w-2.5 h-2.5" />
+                              <span>{substitutingSku === item.sku ? "Close" : "Substitute All"}</span>
+                            </button>
+                          </div>
                         )}
                       </div>
+
+                      {/* Inline Substitute Box (Native Theme with Custom Trigger Button) */}
+                      {substitutingSku === item.sku && (
+                        <div className="p-3 rounded-2xl bg-indigo-50/50 border border-indigo-100/90 space-y-2.5 animate-in fade-in duration-150">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <span className="w-1.5 h-1.5 rounded-full bg-indigo-600 shrink-0" />
+                              <span className="text-xs font-bold text-gray-900 truncate">
+                                Replacement for <span className="font-mono text-indigo-700">{item.sku}</span>:
+                              </span>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => setSubstitutingSku(null)}
+                              className="text-gray-400 hover:text-gray-600 p-1 -mr-1 cursor-pointer"
+                              title="Cancel"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+
+                          {(() => {
+                            const chosenProd = parsedData.availableProducts?.find(
+                              (p) => p.id === selectedSubProduct[item.sku]
+                            );
+                            return (
+                              <div className="space-y-2">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setSkuPicker({
+                                      isOpen: true,
+                                      type: "BATCH",
+                                      fromSku: item.sku,
+                                      selectedProductId: selectedSubProduct[item.sku] || "",
+                                    });
+                                    setSkuSearchQuery("");
+                                  }}
+                                  className="w-full flex items-center justify-between px-3 py-2.5 bg-white border border-indigo-200/80 hover:border-indigo-400 rounded-xl text-xs font-semibold text-gray-900 shadow-2xs transition-all cursor-pointer text-left active:bg-gray-50"
+                                >
+                                  {chosenProd ? (
+                                    <div className="flex items-center gap-2 min-w-0 flex-1">
+                                      <span className="font-mono font-bold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-md text-[11px] shrink-0">
+                                        {chosenProd.sku}
+                                      </span>
+                                      <span className="truncate text-gray-800 font-semibold">{chosenProd.name}</span>
+                                      <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded-md shrink-0 ml-auto mr-1">
+                                        Stock: {chosenProd.currentStock}
+                                      </span>
+                                    </div>
+                                  ) : (
+                                    <span className="text-gray-400 font-normal flex items-center gap-1.5">
+                                      <Search className="w-3.5 h-3.5 text-gray-400" />
+                                      Tap to search & select replacement variant...
+                                    </span>
+                                  )}
+                                  <ChevronDown className="w-4 h-4 text-gray-400 shrink-0 ml-1" />
+                                </button>
+
+                                <div className="flex items-center justify-between gap-2 pt-1">
+                                  <p className="text-[10px] text-gray-500 leading-tight">
+                                    💡 Physical stock naye variant se minus hogi.
+                                  </p>
+                                  <button
+                                    type="button"
+                                    disabled={!selectedSubProduct[item.sku]}
+                                    onClick={() =>
+                                      handleSubstituteBatch(item.sku, selectedSubProduct[item.sku])
+                                    }
+                                    className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white rounded-xl text-xs font-bold transition-all shrink-0 cursor-pointer shadow-xs flex items-center gap-1.5 active:scale-95"
+                                  >
+                                    <Check className="w-3.5 h-3.5" />
+                                    <span>Apply to {item.totalQuantity} Orders</span>
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -619,7 +1223,16 @@ export function BulkDispatchModal({
                             {/* Individual Order's Delivery Partner (Detected dynamically from label, with quick edit) */}
                             <div className="relative inline-flex items-center">
                               <select
-                                value={ord.courier || "DELHIVERY"}
+                                value={
+                                  ord.courier ||
+                                  (parsedData.channel === "AMAZON"
+                                    ? "ATSPL"
+                                    : parsedData.channel === "FLIPKART"
+                                    ? "E-Kart Logistics"
+                                    : parsedData.channel === "MEESHO"
+                                    ? "Valmo"
+                                    : "DELHIVERY")
+                                }
                                 onChange={(e) => updateOrderCourier(idx, e.target.value)}
                                 className="appearance-none bg-blue-50 hover:bg-blue-100/70 text-blue-700 text-[10px] font-bold pl-5 pr-4 py-0.5 rounded-md cursor-pointer transition-colors focus:outline-none"
                                 title="Delivery Partner (Detected from label, click to change)"
@@ -676,30 +1289,45 @@ export function BulkDispatchModal({
                           )}
                         </div>
 
-                        {/* AWB with copy button */}
-                        <div className="flex items-center justify-between bg-white px-2.5 py-1.5 rounded-xl text-[11px] shadow-2xs">
+                        {/* AWB with copy button & Duplicate Dispatched Tag */}
+                        <div className="flex items-center justify-between bg-white px-2.5 py-1.5 rounded-xl text-[11px] shadow-2xs flex-wrap gap-1.5">
                           <span className="font-mono text-gray-600">
                             AWB: <strong className="text-gray-900">{ord.awb}</strong>
                           </span>
-                          <button
-                            type="button"
-                            onClick={() => copyToClipboard(ord.awb)}
-                            className="inline-flex items-center gap-1 text-[10px] font-bold text-gray-500 hover:text-indigo-600 transition-colors cursor-pointer"
-                            title="Copy AWB Number"
-                          >
-                            {copiedAwb === ord.awb ? (
-                              <>
-                                <Check className="w-3 h-3 text-emerald-600" />
-                                <span className="text-emerald-600">Copied</span>
-                              </>
-                            ) : (
-                              <>
-                                <Copy className="w-3 h-3" />
-                                <span>Copy</span>
-                              </>
+                          <div className="flex items-center gap-1.5">
+                            {ord.isAlreadyDispatched && (
+                              <span className="text-[10px] font-bold text-amber-900 bg-amber-100/90 border border-amber-200 px-2 py-0.5 rounded-md flex items-center gap-1">
+                                <ShieldAlert className="w-3 h-3 text-amber-600" />
+                                Dispatched ({ord.dispatchedAt ? new Date(ord.dispatchedAt).toLocaleDateString("en-IN") : "Earlier"})
+                              </span>
                             )}
-                          </button>
+                            <button
+                              type="button"
+                              onClick={() => copyToClipboard(ord.awb)}
+                              className="inline-flex items-center gap-1 text-[10px] font-bold text-gray-500 hover:text-indigo-600 transition-colors cursor-pointer"
+                              title="Copy AWB Number"
+                            >
+                              {copiedAwb === ord.awb ? (
+                                <>
+                                  <Check className="w-3 h-3 text-emerald-600" />
+                                  <span className="text-emerald-600">Copied</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3 h-3" />
+                                  <span>Copy</span>
+                                </>
+                              )}
+                            </button>
+                          </div>
                         </div>
+
+                        {ord.isAlreadyDispatched && (
+                          <div className="text-[10px] text-amber-800 bg-amber-50/90 border border-amber-200/60 px-2.5 py-1 rounded-xl flex items-center gap-1.5 font-medium">
+                            <ShieldAlert className="w-3 h-3 text-amber-600 shrink-0" />
+                            <span>Is order ka stock pehle hi cut ho chuka hai (Double deduction nahi hoga).</span>
+                          </div>
+                        )}
 
                         {/* Per-Order SKU Strip - NO Product Title, ONLY SKU & Quantity */}
                         <div className="space-y-1.5 pt-0.5">
@@ -711,32 +1339,77 @@ export function BulkDispatchModal({
                               </span>
                             </div>
                           ) : (
-                            ord.items.map((item, itemIdx) => (
-                              <div
-                                key={itemIdx}
-                                className="flex items-center justify-between text-xs p-2.5 rounded-xl bg-white shadow-2xs"
-                              >
-                                <div className="flex items-center gap-2 min-w-0">
-                                  <span className="font-mono font-bold text-gray-900 bg-gray-100 px-2 py-0.5 rounded-md text-xs">
-                                    {item.sku}
-                                  </span>
-                                  <span className="font-bold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-md text-[11px]">
-                                    Qty: {item.quantity}
-                                  </span>
+                            ord.items.map((item, itemIdx) => {
+                              const swapKey = `${idx}-${itemIdx}`;
+                              const isSwapping = editingItemSwapKey === swapKey;
+                              return (
+                                <div
+                                  key={itemIdx}
+                                  className="flex flex-col gap-1.5 text-xs p-2.5 rounded-xl bg-white shadow-2xs"
+                                >
+                                  <div className="flex items-center justify-between gap-2">
+                                    <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
+                                      <span className="font-mono font-bold text-gray-900 bg-gray-100 px-2 py-0.5 rounded-md text-xs">
+                                        {item.sku}
+                                      </span>
+                                      {item.isSubstituted && (
+                                        <span className="text-[10px] font-bold text-purple-800 bg-purple-100 px-2 py-0.5 rounded-md border border-purple-200">
+                                          🔄 Substituted (Label: {item.originalSku})
+                                        </span>
+                                      )}
+                                      {item.originalSku && !item.isSubstituted && (
+                                        <span className="text-[10px] font-semibold text-purple-700 bg-purple-50 px-2 py-0.5 rounded-md border border-purple-200/50">
+                                          Mapped: <strong className="font-mono">{item.originalSku}</strong>
+                                        </span>
+                                      )}
+                                      <span className="font-bold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-md text-[11px]">
+                                        Qty: {item.quantity}
+                                      </span>
+                                    </div>
+
+                                    <div className="flex items-center gap-1.5 shrink-0">
+                                      {item.isSubstituted ? (
+                                        <button
+                                          type="button"
+                                          onClick={() => handleRevertSingleItem(idx, itemIdx)}
+                                          className="text-[10px] font-bold text-indigo-700 hover:text-indigo-900 underline cursor-pointer"
+                                        >
+                                          Undo
+                                        </button>
+                                      ) : (
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setSkuPicker({
+                                              isOpen: true,
+                                              type: "SINGLE",
+                                              fromSku: item.sku,
+                                              orderIdx: idx,
+                                              itemIdx: itemIdx,
+                                              selectedProductId: item.productId || "",
+                                            });
+                                            setSkuSearchQuery("");
+                                          }}
+                                          className="text-[10px] font-bold text-indigo-600 hover:text-indigo-800 hover:bg-indigo-50 px-2 py-0.5 rounded-md cursor-pointer transition-colors border border-indigo-200/60 active:scale-95"
+                                        >
+                                          Swap
+                                        </button>
+                                      )}
+
+                                      {item.found ? (
+                                        <span className="text-[11px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-lg flex items-center gap-1">
+                                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" /> Matched
+                                        </span>
+                                      ) : (
+                                        <span className="text-[11px] font-bold text-rose-700 bg-rose-100/70 px-2 py-0.5 rounded-lg flex items-center gap-1">
+                                          <AlertTriangle className="w-3.5 h-3.5 text-rose-600" /> Not in Inventory
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
                                 </div>
-                                <div className="flex items-center gap-1.5 shrink-0">
-                                  {item.found ? (
-                                    <span className="text-[11px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-lg flex items-center gap-1">
-                                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" /> Matched
-                                    </span>
-                                  ) : (
-                                    <span className="text-[11px] font-bold text-rose-700 bg-rose-100/70 px-2 py-0.5 rounded-lg flex items-center gap-1">
-                                      <AlertTriangle className="w-3.5 h-3.5 text-rose-600" /> Not in Inventory
-                                    </span>
-                                  )}
-                                </div>
-                              </div>
-                            ))
+                              );
+                            })
                           )}
                         </div>
                       </div>
@@ -766,10 +1439,18 @@ export function BulkDispatchModal({
               </div>
 
               <div className="flex items-center gap-2 pt-2">
+                <Link
+                  href="/dispatch-history"
+                  onClick={handleClose}
+                  className="px-4 py-2.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200/80 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 active:scale-95"
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  <span>View in History</span>
+                </Link>
                 <button
                   type="button"
                   onClick={handleClose}
-                  className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold shadow-sm transition-all cursor-pointer"
+                  className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold shadow-sm transition-all cursor-pointer active:scale-95"
                 >
                   Done & Close
                 </button>
@@ -798,7 +1479,19 @@ export function BulkDispatchModal({
             </button>
 
             {/* Primary Action Button: Flexible, Single Line, Adaptive Label */}
-            {hasMissingSkus ? (
+            {allOrdersDuplicate ? (
+              <button
+                type="button"
+                disabled={true}
+                className="flex-1 py-2.5 px-3 bg-amber-50 border border-amber-200/90 text-amber-900 rounded-xl text-xs font-bold cursor-not-allowed flex items-center justify-center gap-1.5 whitespace-nowrap overflow-hidden text-ellipsis shadow-none"
+                title="Is file ke sabhi orders pehle hi dispatch ho chuke hain"
+              >
+                <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0" />
+                <span className="truncate">
+                  Blocked (All {parsedData.totalOrders} Orders Already Dispatched)
+                </span>
+              </button>
+            ) : hasMissingSkus ? (
               <button
                 type="button"
                 disabled={true}
@@ -852,6 +1545,186 @@ export function BulkDispatchModal({
           </div>
         )}
       </div>
+
+      {/* ======================================================== */}
+      {/* 📱 NATIVE APP BOTTOM-SHEET SKU PICKER ("CODING WALA")    */}
+      {/* ======================================================== */}
+      {mounted &&
+        skuPicker?.isOpen &&
+        createPortal(
+          <div className="fixed inset-0 z-[160] flex items-end sm:items-center justify-center p-0 sm:p-4">
+            {/* Backdrop */}
+            <div
+              className="fixed inset-0 bg-black/60 backdrop-blur-xs transition-opacity animate-in fade-in duration-200"
+              onClick={() => setSkuPicker(null)}
+            />
+
+            {/* Bottom-Sheet (Mobile) / Centered Modal (Desktop) */}
+            <div className="relative z-10 w-full sm:max-w-lg bg-white rounded-t-[32px] sm:rounded-3xl shadow-2xl flex flex-col max-h-[85vh] sm:max-h-[80vh] overflow-hidden animate-in slide-in-from-bottom duration-250">
+              
+              {/* Top Grab Handle Notch (Mobile) */}
+              <div className="w-12 h-1.5 bg-gray-300 rounded-full mx-auto mt-3 sm:hidden shrink-0" />
+
+              {/* Sheet Header */}
+              <div className="px-5 sm:px-6 pt-3 pb-3.5 border-b border-gray-100 flex items-center justify-between shrink-0">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className="text-[10px] font-bold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-md">
+                      Replacement Variant
+                    </span>
+                    <span className="text-gray-300">•</span>
+                    <span className="text-xs text-gray-500 font-mono truncate">
+                      Original: {skuPicker.fromSku}
+                    </span>
+                  </div>
+                  <h3 className="text-base font-bold text-gray-900 mt-0.5 leading-tight">
+                    Choose In-Stock Product
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSkuPicker(null)}
+                  className="w-8 h-8 rounded-full bg-gray-100 hover:bg-gray-200 active:bg-gray-300 flex items-center justify-center text-gray-500 hover:text-gray-800 transition-colors cursor-pointer shrink-0 ml-2"
+                  title="Close"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* Live Search & Filter Bar */}
+              <div className="p-3.5 sm:px-6 bg-gray-50/70 border-b border-gray-100 shrink-0 space-y-2.5">
+                <div className="relative">
+                  <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400" />
+                  <input
+                    type="text"
+                    value={skuSearchQuery}
+                    onChange={(e) => setSkuSearchQuery(e.target.value)}
+                    placeholder="Search by SKU, product name..."
+                    className="w-full pl-9 pr-8 py-2.5 bg-white border border-gray-200 rounded-xl text-xs text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 shadow-2xs"
+                    autoFocus
+                  />
+                  {skuSearchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setSkuSearchQuery("")}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                {/* Quick Filters */}
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setFilterOnlyInStock(!filterOnlyInStock)}
+                    className={`px-3 py-1 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 touch-manipulation ${
+                      filterOnlyInStock
+                        ? "bg-emerald-600 text-white shadow-xs"
+                        : "bg-white text-gray-600 border border-gray-200 hover:bg-gray-50"
+                    }`}
+                  >
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>In-Stock Only</span>
+                  </button>
+                  <span className="text-[11px] text-gray-400 font-medium">
+                    {pickerAvailableProducts.length} variants available
+                  </span>
+                </div>
+              </div>
+
+              {/* Product Candidates List */}
+              <div className="flex-1 overflow-y-auto p-3.5 sm:p-5 space-y-2">
+                {pickerAvailableProducts.length === 0 ? (
+                  <div className="py-12 text-center text-xs text-gray-400">
+                    Koi matching product nahi mila.
+                  </div>
+                ) : (
+                  pickerAvailableProducts.map((p) => {
+                    const isSelected = skuPicker.selectedProductId === p.id;
+                    const inStock = p.currentStock > 0;
+
+                    return (
+                      <button
+                        key={p.id}
+                        type="button"
+                        onClick={() => {
+                          if (skuPicker.type === "BATCH") {
+                            setSelectedSubProduct((prev) => ({
+                              ...prev,
+                              [skuPicker.fromSku]: p.id,
+                            }));
+                            setSkuPicker(null);
+                          } else if (skuPicker.type === "SINGLE") {
+                            handleSubstituteSingleItem(
+                              skuPicker.orderIdx!,
+                              skuPicker.itemIdx!,
+                              p.id
+                            );
+                            setSkuPicker(null);
+                          }
+                        }}
+                        className={`w-full text-left p-3.5 rounded-2xl border transition-all cursor-pointer flex items-center justify-between gap-3 active:scale-[0.99] touch-manipulation ${
+                          isSelected
+                            ? "bg-indigo-50/80 border-indigo-400 shadow-xs ring-1 ring-indigo-400"
+                            : "bg-white border-gray-100 hover:border-gray-200 hover:bg-gray-50/50 shadow-2xs"
+                        }`}
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="font-mono font-bold text-xs text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-md">
+                              {p.sku}
+                            </span>
+                            <span
+                              className={`text-[10px] font-bold px-2 py-0.5 rounded-md ${
+                                inStock
+                                  ? "bg-emerald-50 text-emerald-700 border border-emerald-100/60"
+                                  : "bg-rose-50 text-rose-700 border border-rose-100/60"
+                              }`}
+                            >
+                              {inStock ? `Stock: ${p.currentStock}` : "Out of Stock"}
+                            </span>
+                          </div>
+                          <p className="text-xs font-semibold text-gray-800 mt-1 line-clamp-1">
+                            {p.name}
+                          </p>
+                        </div>
+
+                        <div className="shrink-0 flex items-center">
+                          {isSelected ? (
+                            <div className="w-6 h-6 rounded-full bg-indigo-600 text-white flex items-center justify-center shadow-xs">
+                              <Check className="w-3.5 h-3.5 stroke-[2.5]" />
+                            </div>
+                          ) : (
+                            <div className="w-6 h-6 rounded-full border border-gray-200 text-transparent flex items-center justify-center">
+                              <Check className="w-3.5 h-3.5 text-gray-200" />
+                            </div>
+                          )}
+                        </div>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+
+              {/* Sheet Footer */}
+              <div className="p-3.5 bg-gray-50 border-t border-gray-100 text-[11px] text-gray-500 shrink-0 flex items-center justify-between gap-2">
+                <span className="truncate">
+                  💡 Label par original SKU rahega, physical stock naye variant se minus hogi.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setSkuPicker(null)}
+                  className="text-xs font-bold text-gray-700 hover:text-gray-900 active:bg-gray-100 px-3.5 py-1.5 bg-white border border-gray-200 rounded-xl shrink-0 cursor-pointer shadow-2xs"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
     </div>
   );
 }

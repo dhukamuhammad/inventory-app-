@@ -13,6 +13,7 @@ interface ConfirmDialogProps {
   cancelText?: string;
   isDestructive?: boolean;
   loading?: boolean;
+  children?: React.ReactNode;
 }
 
 export function ConfirmDialog({
@@ -25,22 +26,36 @@ export function ConfirmDialog({
   cancelText = "Cancel",
   isDestructive = false,
   loading = false,
+  children,
 }: ConfirmDialogProps) {
   return (
     <Modal isOpen={isOpen} onClose={onClose} title="">
-      <div className="flex flex-col items-center text-center pb-2">
-        <div className={`w-12 h-12 rounded-full flex items-center justify-center mb-4 ${isDestructive ? 'bg-red-100' : 'bg-blue-100'}`}>
-          <AlertTriangle className={`w-6 h-6 ${isDestructive ? 'text-red-600' : 'text-blue-600'}`} />
+      <div className="flex flex-col items-center text-center pb-1">
+        <div 
+          className={`w-14 h-14 rounded-2xl flex items-center justify-center mb-3 shadow-sm ${
+            isDestructive 
+              ? 'bg-rose-50 border border-rose-100/80 text-rose-600 shadow-rose-100/50' 
+              : 'bg-indigo-50 border border-indigo-100/80 text-indigo-600 shadow-indigo-100/50'
+          }`}
+        >
+          <AlertTriangle className="w-6 h-6 stroke-[2.2]" />
         </div>
-        <h3 className="text-lg font-bold text-gray-900 mb-2">{title}</h3>
-        <p className="text-sm text-gray-500 mb-6 px-4">{description}</p>
         
-        <div className="flex gap-3 w-full">
+        <h3 className="text-lg font-bold text-slate-900 mb-1.5">{title}</h3>
+        <p className="text-xs sm:text-sm text-slate-500 mb-4 px-2 leading-relaxed">{description}</p>
+        
+        {children && (
+          <div className="w-full mb-4 text-left">
+            {children}
+          </div>
+        )}
+        
+        <div className="flex flex-col-reverse sm:flex-row gap-2.5 w-full">
           <button
             type="button"
             onClick={onClose}
             disabled={loading}
-            className="flex-1 px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+            className="w-full sm:flex-1 h-12 px-4 text-sm font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 active:scale-[0.98] rounded-2xl transition-all cursor-pointer disabled:opacity-50"
           >
             {cancelText}
           </button>
@@ -48,10 +63,10 @@ export function ConfirmDialog({
             type="button"
             onClick={onConfirm}
             disabled={loading}
-            className={`flex-1 px-4 py-2 text-sm font-medium text-white border border-transparent rounded-lg focus:outline-none focus:ring-2 focus:ring-offset-2 disabled:opacity-50 ${
+            className={`w-full sm:flex-1 h-12 px-4 text-sm font-bold text-white rounded-2xl transition-all active:scale-[0.98] cursor-pointer disabled:opacity-50 ${
               isDestructive 
-                ? "bg-red-600 hover:bg-red-700 focus:ring-red-500" 
-                : "bg-blue-600 hover:bg-blue-700 focus:ring-blue-500"
+                ? "bg-rose-600 hover:bg-rose-700 shadow-sm shadow-rose-600/20" 
+                : "bg-indigo-600 hover:bg-indigo-700 shadow-sm shadow-indigo-600/20"
             }`}
           >
             {loading ? "Processing..." : confirmText}

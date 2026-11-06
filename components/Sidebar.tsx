@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, Package, ArrowLeftRight, BarChart3, Settings } from "lucide-react";
+import { LayoutDashboard, Package, ArrowLeftRight, BarChart3, Settings, GitFork, RotateCcw, FileText } from "lucide-react";
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -10,6 +10,9 @@ export function Sidebar() {
   const navItems = [
     { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
     { name: "Inventory", href: "/inventory", icon: Package },
+    { name: "Dispatch History", href: "/dispatch-history", icon: FileText },
+    { name: "SKU Mappings", href: "/mappings", icon: GitFork },
+    { name: "Returns & RTO", href: "/returns", icon: RotateCcw },
     { name: "Movements", href: "/movements", icon: ArrowLeftRight },
     { name: "Analytics", href: "/analytics", icon: BarChart3 },
   ];

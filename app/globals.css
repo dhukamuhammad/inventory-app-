@@ -35,3 +35,10 @@ body {
   }
 }
 
+/* Hide Next.js dev overlay indicator (floating black N button) */
+nextjs-portal,
+[data-nextjs-toast],
+[data-nextjs-dev-overlay] {
+  display: none !important;
+}
+

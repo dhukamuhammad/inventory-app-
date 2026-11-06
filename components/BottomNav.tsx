@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, Package, Menu } from "lucide-react";
+import { LayoutDashboard, Package, GitFork, User } from "lucide-react";
 
 export function BottomNav() {
   const pathname = usePathname();
@@ -10,11 +10,12 @@ export function BottomNav() {
   const navItems = [
     { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
     { name: "Inventory", href: "/inventory", icon: Package },
-    { name: "Menu", href: "/menu", icon: Menu },
+    { name: "Mappings", href: "/mappings", icon: GitFork },
+    { name: "Profile", href: "/menu", icon: User },
   ];
 
   return (
-    <nav className="md:hidden fixed bottom-3.5 inset-x-4 max-w-xs mx-auto z-50 bg-white/95 backdrop-blur-xl rounded-full px-3 py-1.5 shadow-[0_12px_36px_-6px_rgba(0,0,0,0.12)] border border-white/80 ring-1 ring-black/[0.04] flex items-center justify-around">
+    <nav className="md:hidden fixed bottom-3 inset-x-3 max-w-sm mx-auto z-50 bg-white/95 backdrop-blur-xl rounded-full px-2 py-1.5 shadow-[0_12px_36px_-6px_rgba(0,0,0,0.12)] border border-gray-100 flex items-center justify-around">
       {navItems.map((item) => {
         const isActive = pathname === item.href;
         const Icon = item.icon;

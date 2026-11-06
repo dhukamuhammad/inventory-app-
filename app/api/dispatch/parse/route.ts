@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
+import path from "path";
 
 export const runtime = "nodejs";
 
@@ -16,25 +17,120 @@ if (typeof (globalThis as any).DOMMatrix === "undefined") {
   }
 }
 
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { createCanvas } = require("@napi-rs/canvas");
+
+// -------------------------------------------------------------
+// HIGH-SPEED BARCODE DECODER (ZXing - Zero Tesseract Crashes)
+// -------------------------------------------------------------
+let zxingReaderInstance: any = null;
+function getZxingReader() {
+  if (!zxingReaderInstance) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const ZXing = require("html5-qrcode/third_party/zxing-js.umd.js");
+      const reader = new ZXing.MultiFormatReader();
+      const hints = new Map();
+      hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+        ZXing.BarcodeFormat.CODE_128,
+        ZXing.BarcodeFormat.QR_CODE,
+        ZXing.BarcodeFormat.CODE_39,
+        ZXing.BarcodeFormat.EAN_13,
+      ]);
+      hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+      reader.setHints(hints);
+      zxingReaderInstance = { reader, ZXing };
+    } catch (e) {
+      console.warn("ZXing initialization warning:", e);
+    }
+  }
+  return zxingReaderInstance;
+}
+
+// Candidate multi-zone barcode decoder (scans full page dynamically across zones with quiet zones & contrast enhancement)
+function decodeDynamicBarcode(fullCanvas: any, width: number, height: number): string | null {
+  try {
+    const inst = getZxingReader();
+    if (!inst) return null;
+    const { reader, ZXing } = inst;
+
+    // Candidate scanning zones across the entire page (covers any platform layout & paper size)
+    const zones = [
+      // Zone 1: Top-left quadrant (Standard Amazon, Delhivery, Flipkart)
+      { x: 0, y: 0, w: Math.floor(width * 0.60), h: Math.floor(height * 0.25) },
+      // Zone 2: Upper-middle left inside inner box (Speed Post, Meesho headers, shifted barcodes)
+      { x: Math.floor(width * 0.09), y: Math.floor(height * 0.17), w: Math.floor(width * 0.42), h: Math.floor(height * 0.14) },
+      // Zone 3: Full top width (Standard wider labels)
+      { x: 0, y: 0, w: width, h: Math.floor(height * 0.25) },
+      // Zone 4: Center band (Centered waybills, Delhivery B2B)
+      { x: 0, y: Math.floor(height * 0.25), w: width, h: Math.floor(height * 0.35) },
+      // Zone 5: Bottom band (Bottom-oriented waybills)
+      { x: 0, y: Math.floor(height * 0.60), w: width, h: Math.floor(height * 0.35) },
+    ];
+
+    for (const z of zones) {
+      if (z.w <= 0 || z.h <= 0) continue;
+      // Add white margin (quiet zone) for barcode decoders to detect start/stop delimiters
+      const pad = 18;
+      const sub = createCanvas(z.w + pad * 2, z.h + pad * 2);
+      const sctx = sub.getContext("2d");
+      sctx.fillStyle = "#FFFFFF";
+      sctx.fillRect(0, 0, sub.width, sub.height);
+      sctx.drawImage(fullCanvas, z.x, z.y, z.w, z.h, pad, pad, z.w, z.h);
+
+      const imgData = sctx.getImageData(0, 0, sub.width, sub.height);
+      const len = imgData.data.length / 4;
+      const lums = new Uint8ClampedArray(len);
+      for (let i = 0; i < len; i++) {
+        lums[i] = (imgData.data[i * 4] * 77 + imgData.data[i * 4 + 1] * 150 + imgData.data[i * 4 + 2] * 29) >> 8;
+      }
+
+      // Pass A: Standard Hybrid Binarizer
+      try {
+        const bmp = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(new ZXing.RGBLuminanceSource(lums, sub.width, sub.height)));
+        const res = reader.decode(bmp);
+        if (res && res.getText()) return res.getText().trim();
+      } catch {}
+
+      // Pass B: High-contrast binarizer (rescues anti-aliased 1-pixel barcode bars)
+      for (const thresh of [115, 125, 135]) {
+        const sharpLums = new Uint8ClampedArray(len);
+        for (let i = 0; i < len; i++) {
+          sharpLums[i] = lums[i] < thresh ? 0 : 255;
+        }
+        try {
+          const bmp = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(new ZXing.RGBLuminanceSource(sharpLums, sub.width, sub.height)));
+          const res = reader.decode(bmp);
+          if (res && res.getText()) return res.getText().trim();
+        } catch {}
+      }
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 // -------------------------------------------------------------
 // DYNAMIC COURIER LOGISTICS DETECTOR (ZERO HARDCODING)
 // -------------------------------------------------------------
 function extractCourier(text: string): string {
   if (!text) return "";
 
-  // 1. Check known carrier names (case-insensitive)
+  // 1. Direct carrier brand matches (case-insensitive)
   if (/\bdelhivery\b/i.test(text)) return "DELHIVERY";
-  if (/\b(atspl|ats|amazon\s*transportation|easy\s*ship)\b/i.test(text)) return "ATSPL";
-  if (/\b(e-?kart\s*logistics|e-?kart)\b/i.test(text)) return "E-Kart Logistics";
+  if (/\b(atspl_ips|india\s*post|speed\s*post|ems\s*speed)\b/i.test(text)) return "India Post";
+  if (/\b(atspl|ats\b|amazon\s*transportation|easy\s*ship)\b/i.test(text)) return "ATSPL";
+  if (/\b(e-?kart\s*logistics|e-?kart\b|ekart\b|fmp)\b/i.test(text)) return "E-Kart Logistics";
   if (/\b(blue\s*dart|bluedart)\b/i.test(text)) return "Blue Dart";
   if (/\bshadowfax\b/i.test(text)) return "Shadowfax";
   if (/\bxpressbees\b/i.test(text)) return "Xpressbees";
   if (/\bvalmo\b/i.test(text)) return "Valmo";
   if (/\bdtdc\b/i.test(text)) return "DTDC";
-  if (/\b(india\s*post|speed\s*post)\b/i.test(text)) return "India Post";
   if (/\bfedex\b/i.test(text)) return "FedEx";
 
-  // 2. Generic carrier label detection
+  // 2. Generic carrier label detection (e.g. "Courier: Smartr Logistics")
   const labelMatch = text.match(
     /(?:Courier|Carrier|Logistics|Delivery Partner|Delivered By)[:\s]+([A-Za-z0-9\s\-]+?)(?=\n|\r|,|$)/i
   );
@@ -45,8 +141,40 @@ function extractCourier(text: string): string {
     }
   }
 
-  // Never return a hardcoded fake courier!
   return "";
+}
+
+// Multi-Tier Courier Resolver: Label Text Priority > AWB Format Cross-Check > Marketplace Default
+function resolveCourier(labelText: string, awb: string, channel: string): string {
+  // 1. Label text (ground truth printed on label)
+  const fromText = extractCourier(labelText);
+  if (fromText) {
+    if (/ATSPL_IPS/i.test(labelText) || /speed\s*post/i.test(labelText) || /india\s*post/i.test(labelText)) {
+      return "India Post";
+    }
+    return fromText;
+  }
+
+  // 2. AWB Carrier Standard Series
+  if (/^(?:13|14)\d{11,14}$/.test(awb)) {
+    return "DELHIVERY";
+  }
+  if (/^(?:37|38|39)\d{10}$/.test(awb)) {
+    return "ATSPL";
+  }
+  if (/^[A-Z]{2}\d{9}[A-Z]{2}$/i.test(awb)) {
+    return "India Post";
+  }
+  if (/^FMP/i.test(awb)) {
+    return "E-Kart Logistics";
+  }
+
+  // 3. Channel Default Fallback
+  if (channel === "AMAZON") return "ATSPL";
+  if (channel === "FLIPKART") return "E-Kart Logistics";
+  if (channel === "MEESHO") return "Valmo";
+
+  return "DELHIVERY";
 }
 
 function lcs(a: string, b: string): number {
@@ -63,47 +191,57 @@ function lcs(a: string, b: string): number {
 }
 
 // -------------------------------------------------------------
-// INTELLIGENT SKU RESOLVER (EXACT + NORMALIZED + OCR NOISE TOLERANT)
+// INTELLIGENT SKU RESOLVER (EXACT + SAFE BOUNDARY + NORMALIZED + OCR NOISE TOLERANT)
 // -------------------------------------------------------------
 function findMatchingSku(text: string, knownSkus: string[]): string | null {
   if (!text || !knownSkus || knownSkus.length === 0) return null;
 
-  // 1. Exact word-boundary match
-  for (const kSku of knownSkus) {
-    const escaped = kSku.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const exactRegex = new RegExp("\\b" + escaped + "\\b", "i");
-    if (exactRegex.test(text)) return kSku;
-  }
+  const cleanText = text.trim().toLowerCase();
 
-  // 2. Normalized alphanumeric match (removes spaces, hyphens)
-  const normText = text.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+  // 1. Direct exact equality match (fastest & highest confidence)
   for (const kSku of knownSkus) {
-    const normSku = kSku.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
-    if (normText.includes(normSku)) return kSku;
-  }
-
-  // 3. Substring & Token LCS Fuzzy Match (handles OCR noise like M<->IT, 7<->0, C<->O, spaced digits)
-  const rawTokens = text.match(/\b[A-Za-z0-9\-]{3,25}\b/g) || [];
-  const tokens: string[] = [];
-  for (let i = 0; i < rawTokens.length; i++) {
-    const clean = rawTokens[i].replace(/[^A-Za-z0-9]/g, "").toUpperCase();
-    tokens.push(clean);
-    if (i + 1 < rawTokens.length) {
-      const nextClean = rawTokens[i + 1].replace(/[^A-Za-z0-9]/g, "").toUpperCase();
-      tokens.push(clean + nextClean);
+    if (cleanText === kSku.trim().toLowerCase()) {
+      return kSku;
     }
   }
 
+  // 2. Safe custom boundary match (hyphens, underscores, slashes are treated as SKU characters, not word boundaries)
+  for (const kSku of knownSkus) {
+    const escaped = kSku.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const exactRegex = new RegExp("(?<=^|[^A-Za-z0-9\\-_/])" + escaped + "(?=$|[^A-Za-z0-9\\-_/])", "i");
+    if (exactRegex.test(text)) return kSku;
+  }
+
+  // 3. Exact normalized alphanumeric match (without hyphens/spaces)
+  const normText = text.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+  for (const kSku of knownSkus) {
+    const normSku = kSku.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+    if (normText === normSku) return kSku;
+  }
+
+  // 4. Token-by-token normalized exact match
+  const rawTokens = text.split(/[\s,;|()[\]{}]+/).filter((t) => t.trim().length >= 3);
+  for (const kSku of knownSkus) {
+    const normSku = kSku.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+    for (const tok of rawTokens) {
+      const normTok = tok.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+      if (normTok === normSku) return kSku;
+    }
+  }
+
+  // 5. High-confidence fuzzy match for OCR character substitutions
   let bestSku: string | null = null;
   let bestScore = 0;
-
-  for (const tok of tokens) {
-    if (tok.length < 5) continue;
+  for (const tok of rawTokens) {
+    const cleanTok = tok.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+    if (cleanTok.length < 5) continue;
     for (const kSku of knownSkus) {
       const normSku = kSku.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
-      const common = lcs(tok, normSku);
-      const ratio = common / Math.max(tok.length, normSku.length);
-      if (ratio > bestScore && ratio >= 0.58) {
+      // Lengths must be close (diff at most 2 chars)
+      if (Math.abs(cleanTok.length - normSku.length) > 2) continue;
+      const common = lcs(cleanTok, normSku);
+      const ratio = common / Math.max(cleanTok.length, normSku.length);
+      if (ratio > bestScore && ratio >= 0.82) {
         bestScore = ratio;
         bestSku = kSku;
       }
@@ -111,171 +249,6 @@ function findMatchingSku(text: string, knownSkus: string[]): string | null {
   }
 
   return bestSku;
-}
-
-// -------------------------------------------------------------
-// DYNAMIC MULTI-ORDER BLOCK SPLITTER (GRID & SUB-LABEL SUPPORT)
-// -------------------------------------------------------------
-function splitMultipleOrdersInBlock(text: string): string[] {
-  if (!text || text.length < 80) return [text];
-
-  const meeshoPoMatches = [...text.matchAll(/Purchase Order No\.?\s*\d{15,20}/gi)];
-  const fkMatches = [...text.matchAll(/\bOD\d{16,22}\b/g)];
-  const amzMatches = [...text.matchAll(/\b\d{3}-[0-9]{7}-[0-9]{7}\b/g)];
-  const delAwbMatches = [...text.matchAll(/\b14\d{13,15}\b/g)];
-
-  const maxMatches = Math.max(
-    meeshoPoMatches.length,
-    fkMatches.length,
-    amzMatches.length,
-    delAwbMatches.length > 1 ? delAwbMatches.length : 0
-  );
-
-  if (maxMatches > 1) {
-    const delimiterRegex =
-      /(?=Purchase Order No\.?\s*\d{15,20}|Customer Address|OD\d{16,22}|Order\s*Id[:\s]*\d{3}-\d{7}-\d{7}|\b14\d{13,15}\b)/i;
-    const parts = text
-      .split(delimiterRegex)
-      .map((p) => p.trim())
-      .filter((p) => p.length > 60 && /(?:AWB|Order|SKU|Delhivery|Logistics|Prepaid|COD|Customer|Ship)/i.test(p));
-    if (parts.length > 1) {
-      return parts;
-    }
-  }
-
-  return [text];
-}
-
-// -------------------------------------------------------------
-// DYNAMIC MULTI-LABEL PAGE EXTRACTOR (A4 SHEETS & IMAGE LABELS)
-// -------------------------------------------------------------
-async function extractPageLabels(page: any, pageNum: number): Promise<string[]> {
-  try {
-    const tc = await page.getTextContent();
-    const pageText = tc.items.map((it: any) => it.str).join("\n").trim();
-
-    // 1. DIGITAL TEXT PATH
-    if (pageText.length >= 60) {
-      const splitOrders = splitMultipleOrdersInBlock(pageText);
-      if (splitOrders.length > 1) {
-        return splitOrders;
-      }
-      return [pageText];
-    }
-
-    // 2. IMAGE / FLATTENED VECTOR DRAWING PATH (e.g. Print-to-PDF, Scanned labels)
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { createCanvas } = require("@napi-rs/canvas");
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fs = require("fs");
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const os = require("os");
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const path = require("path");
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { execFileSync } = require("child_process");
-
-    const viewport = page.getViewport({ scale: 2.8 });
-    const canvas = createCanvas(viewport.width, viewport.height);
-    const ctx = canvas.getContext("2d");
-    await page.render({ canvasContext: ctx, viewport }).promise;
-
-    // Check if aspect ratio is A4 sheet (e.g. height >= 1000px, width >= 700px)
-    const isA4Sheet = viewport.height >= 1000 && viewport.width >= 700;
-
-    if (isA4Sheet) {
-      const qw = Math.floor(canvas.width / 2);
-      const qh = Math.floor(canvas.height / 2);
-
-      const quadrants = [
-        { name: "TL", x: 0, y: 0 },
-        { name: "TR", x: qw, y: 0 },
-        { name: "BL", x: 0, y: qh },
-        { name: "BR", x: qw, y: qh },
-      ];
-
-      const tmpFiles: string[] = [];
-      quadrants.forEach((q, idx) => {
-        const qc = createCanvas(qw, qh);
-        const qctx = qc.getContext("2d");
-        qctx.drawImage(canvas, q.x, q.y, qw, qh, 0, 0, qw, qh);
-        const tmp = path.join(
-          os.tmpdir(),
-          `quad_${Date.now()}_p${pageNum}_${idx}_${Math.random().toString(36).substring(7)}.png`
-        );
-        fs.writeFileSync(tmp, qc.toBuffer("image/png"));
-        tmpFiles.push(tmp);
-      });
-
-      const workerScript = path.join(process.cwd(), "lib", "ocrWorker.js");
-      let results: { file: string; success: boolean; text: string }[] = [];
-      try {
-        const resJsonStr = execFileSync("node", [workerScript, ...tmpFiles], {
-          timeout: 45000,
-          encoding: "utf8",
-        });
-        const parsed = JSON.parse(resJsonStr);
-        results = parsed.results || [];
-      } catch (ocrErr) {
-        console.error("Batch OCR worker error:", ocrErr);
-      } finally {
-        tmpFiles.forEach((f) => {
-          try {
-            fs.unlinkSync(f);
-          } catch {}
-        });
-      }
-
-      // Filter out empty quadrants (keeps only valid shipping labels)
-      const validTexts: string[] = [];
-      for (const r of results) {
-        const txt = (r.text || "").trim();
-        if (
-          txt.length > 80 &&
-          /(?:AWB|Order|SKU|Delhivery|Logistics|Prepaid|COD|Customer|Ship|Return Code|Product Details)/i.test(txt)
-        ) {
-          validTexts.push(txt);
-        }
-      }
-
-      if (validTexts.length > 0) {
-        const finalExtracted: string[] = [];
-        for (const vt of validTexts) {
-          const subOrders = splitMultipleOrdersInBlock(vt);
-          finalExtracted.push(...subOrders);
-        }
-        return finalExtracted;
-      }
-    }
-
-    // 3. Single full page OCR fallback (e.g. 4x6 thermal label)
-    const fullTmp = path.join(
-      os.tmpdir(),
-      `single_page_${Date.now()}_p${pageNum}_${Math.random().toString(36).substring(7)}.png`
-    );
-    fs.writeFileSync(fullTmp, canvas.toBuffer("image/png"));
-    const workerScript = path.join(process.cwd(), "lib", "ocrWorker.js");
-    let fullText = "";
-    try {
-      const resJsonStr = execFileSync("node", [workerScript, fullTmp], {
-        timeout: 30000,
-        encoding: "utf8",
-      });
-      const parsed = JSON.parse(resJsonStr);
-      fullText = parsed.text || "";
-    } catch (err) {
-      console.error("Full page OCR error:", err);
-    } finally {
-      try {
-        fs.unlinkSync(fullTmp);
-      } catch {}
-    }
-
-    return fullText.length > 30 ? splitMultipleOrdersInBlock(fullText) : [];
-  } catch (err) {
-    console.error(`Error processing page ${pageNum}:`, err);
-    return [];
-  }
 }
 
 // -------------------------------------------------------------
@@ -395,17 +368,13 @@ function parseFlipkartPage(pageText: string, knownSkus: string[] = []) {
 
   // Strategy 4: Direct Inventory Cross-Match (Format-Agnostic Database Fallback)
   if (items.length === 0 && knownSkus && knownSkus.length > 0) {
-    for (const kSku of knownSkus) {
-      const escaped = kSku.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const skuRegex = new RegExp("\\b" + escaped + "\\b", "i");
-      if (skuRegex.test(pageText)) {
-        items.push({
-          sku: kSku,
-          description: "Flipkart Product",
-          quantity: 1,
-        });
-        break;
-      }
+    const matchedSku = findMatchingSku(pageText, knownSkus);
+    if (matchedSku) {
+      items.push({
+        sku: matchedSku,
+        description: "Flipkart Product",
+        quantity: 1,
+      });
     }
   }
 
@@ -512,7 +481,7 @@ function parseMeeshoPage(pageText: string, knownSkus: string[] = []) {
         quantity: parseInt(rawQty, 10) || 1,
       });
       if (rawOrder) {
-        orderId = rawOrder.split("_")[0].trim();
+        orderId = rawOrder.trim();
       }
     }
   }
@@ -534,7 +503,7 @@ function parseMeeshoPage(pageText: string, knownSkus: string[] = []) {
             quantity: parseInt(m[3], 10) || 1,
           });
           if (!orderId) {
-            orderId = m[5].split("_")[0].trim();
+            orderId = m[5].trim();
           }
         }
       }
@@ -570,10 +539,10 @@ function parseMeeshoPage(pageText: string, knownSkus: string[] = []) {
 
   if (!orderId) {
     const poMatch =
+      pageText.match(/Order\s*No\.?[\s\S]*?([0-9_]{15,25})/i) ||
       pageText.match(/Purchase Order No\.?\s*([0-9_]+)/i) ||
-      pageText.match(/Order\s*No\.?[\s\S]*?(\d{15,22})/i) ||
-      pageText.match(/\b(34\d{16})\b/);
-    if (poMatch) orderId = (poMatch[1] || poMatch[0]).split("_")[0].trim();
+      pageText.match(/\b(34\d{16}(?:_\d+)?)\b/);
+    if (poMatch) orderId = (poMatch[1] || poMatch[0]).trim();
   }
 
   const hasMissingSku = items.length === 0;
@@ -612,12 +581,19 @@ function parseAmazonOrderBlock(combinedText: string, knownSkus: string[] = []) {
     combinedText.match(/Ship Date[:\s]*([0-9]{2}-[A-Za-z]{3})/i);
   const orderDate = dateMatch ? dateMatch[1].trim() : "";
 
-  // 3. Real AWB Tracking Number from Label (e.g. AWB# 13371887426321)
+  // 3. Real AWB Tracking Number from Label (e.g. AWB 374111691359 or 13371887426321)
   const awbMatch =
-    combinedText.match(/AWB[#:\s]*([0-9A-Za-z]+)/i) ||
+    combinedText.match(/(?:AWB|AWS|AW|AB|Tracking\s*(?:No|Number)?)[#:\s]*([0-9]{10,14})/i) ||
+    combinedText.match(/\b(37\d{10})\b/) ||
     combinedText.match(/\b(13\d{12})\b/) ||
-    combinedText.match(/\b(37\d{10})\b/);
-  const awb = awbMatch ? awbMatch[1].trim() : orderId || "N/A";
+    combinedText.match(/\b(37\d{8,11})\b/) ||
+    combinedText.match(/AWB[#:\s]*([0-9A-Za-z]+)/i);
+
+  let awb = awbMatch ? awbMatch[1].trim() : "N/A";
+  // Never copy Order ID into AWB
+  if (awb === orderId) {
+    awb = "N/A";
+  }
 
   // 4. Courier Logistics - DYNAMICALLY EXTRACTED FROM LABEL
   const courier = extractCourier(combinedText);
@@ -631,13 +607,12 @@ function parseAmazonOrderBlock(combinedText: string, knownSkus: string[] = []) {
 
   // 6. Destination City, State & Pincode
   let destination = "";
-  const shipAddrMatch = combinedText.match(/Shipping Address\s*:?[\s\S]*?(?=Place of supply|Place of delivery|Invoice Number|$)/i);
-  if (shipAddrMatch) {
-    const pinMatch = shipAddrMatch[0].match(/([A-Za-z\s]+),\s*([A-Za-z\s]+),\s*(\d{6})/);
-    if (pinMatch) {
-      const cleanCity = pinMatch[1].replace(/\n/g, " ").trim();
-      destination = `${cleanCity}, ${pinMatch[2].trim()} (${pinMatch[3]})`;
-    }
+  const shipSection = combinedText.split(/Shipping Address\s*:?/i)[1] || combinedText;
+  const pinMatch = shipSection.match(/([A-Za-z\s]+),\s*([A-Za-z\s]+),\s*(\d{6})/);
+  if (pinMatch) {
+    const cityLines = pinMatch[1].trim().split("\n");
+    const city = cityLines[cityLines.length - 1].trim();
+    destination = `${city}, ${pinMatch[2].trim()} (${pinMatch[3]})`;
   }
 
   if (!destination) {
@@ -677,17 +652,13 @@ function parseAmazonOrderBlock(combinedText: string, knownSkus: string[] = []) {
 
   // Strategy Fallback: Direct Inventory Cross-Match
   if (items.length === 0 && knownSkus && knownSkus.length > 0) {
-    for (const kSku of knownSkus) {
-      const escaped = kSku.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const skuRegex = new RegExp("\\b" + escaped + "\\b", "i");
-      if (skuRegex.test(combinedText)) {
-        items.push({
-          sku: kSku,
-          description: "Amazon Product",
-          quantity: 1,
-        });
-        break;
-      }
+    const matchedSku = findMatchingSku(combinedText, knownSkus);
+    if (matchedSku) {
+      items.push({
+        sku: matchedSku,
+        description: "Amazon Product",
+        quantity: 1,
+      });
     }
   }
 
@@ -824,7 +795,8 @@ export async function POST(req: NextRequest) {
 
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { PDFParse } = require("pdf-parse");
-    const parser = new PDFParse(uint8Array);
+    const fontPath = path.join(process.cwd(), "node_modules", "pdfjs-dist", "standard_fonts").replace(/\\/g, "/") + "/";
+    const parser = new PDFParse({ data: uint8Array, standardFontDataUrl: fontPath });
     const doc = await parser.load();
 
     if (!doc || doc.numPages === 0) {
@@ -834,27 +806,31 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 1. EXTRACT ALL SHIPPING LABELS ACROSS PAGES (WITH DYNAMIC GRID SPLITTING & OCR)
-    const labelTexts: string[] = [];
-    let combinedFullText = "";
+    // 1. EXTRACT ALL PAGE TEXT CONTENT FAST (DIGITAL TEXT FIRST)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { createCanvas } = require("@napi-rs/canvas");
 
-    for (let i = 1; i <= doc.numPages; i++) {
-      const page = await doc.getPage(i);
-      const extractedLabels = await extractPageLabels(page, i);
-      for (const lbl of extractedLabels) {
-        const clean = lbl.trim();
-        if (clean.length > 30) {
-          labelTexts.push(clean);
-          combinedFullText += "\n" + clean;
-        }
+    const pageDataList: { pageNum: number; text: string; pageObj: any }[] = [];
+    const CHUNK_SIZE = 25;
+    for (let i = 1; i <= doc.numPages; i += CHUNK_SIZE) {
+      const batchPromises = [];
+      for (let p = i; p < i + CHUNK_SIZE && p <= doc.numPages; p++) {
+        batchPromises.push(
+          (async (pNum) => {
+            const page = await doc.getPage(pNum);
+            const tc = await page.getTextContent();
+            const txt = tc.items.map((it: any) => it.str).join("\n").trim();
+            return { pageNum: pNum, text: txt, pageObj: page };
+          })(p)
+        );
       }
+      const results = await Promise.all(batchPromises);
+      pageDataList.push(...results);
     }
 
-    if (labelTexts.length === 0 || combinedFullText.length < 30) {
-      return NextResponse.json(
-        { success: false, error: "Unable to read contents from this PDF. Please check file format." },
-        { status: 400 }
-      );
+    let combinedFullText = "";
+    for (const p of pageDataList) {
+      if (p.text.length > 20) combinedFullText += "\n" + p.text;
     }
 
     // 2. AUTO-DETECT MARKETPLACE (Amazon vs Meesho vs Flipkart vs Universal Other)
@@ -885,18 +861,69 @@ export async function POST(req: NextRequest) {
       channelLabel = "General / Other";
     }
 
-    // 3. FETCH PRODUCTS FOR DYNAMIC SKU MATCHING & SAFETY FALLBACK
-    const allProducts = await prisma.product.findMany({
-      select: {
-        id: true,
-        name: true,
-        sku: true,
-        currentStock: true,
-        costPrice: true,
-      },
+    // 3. FETCH PRODUCTS & SKU MAPPINGS FOR MULTI-LISTING RESOLUTION
+    const [allProducts, allMappings] = await Promise.all([
+      prisma.product.findMany({
+        select: {
+          id: true,
+          name: true,
+          sku: true,
+          currentStock: true,
+          costPrice: true,
+        },
+      }),
+      prisma.skuMapping.findMany({
+        include: {
+          product: {
+            select: {
+              id: true,
+              name: true,
+              sku: true,
+              currentStock: true,
+              costPrice: true,
+            },
+          },
+        },
+      }),
+    ]);
+
+    // Platform-Scoped SKU Mapping Lookup with Channel Prioritization
+    // When channel is detected (e.g. MEESHO), filter out mappings belonging to other platforms (e.g. AMAZON).
+    const relevantMappings = allMappings.filter((m) => {
+      if (channel === "OTHER") return true;
+      const plat = (m.platform || "ALL").toUpperCase();
+      return plat === channel || plat === "ALL";
     });
 
-    const knownSkus = allProducts.map((p) => p.sku);
+    // Sort mappings so channel-specific takes precedence over "ALL"
+    const sortedMappings = [...relevantMappings].sort((a, b) => {
+      const aIsExact = (a.platform || "").toUpperCase() === channel ? 1 : 0;
+      const bIsExact = (b.platform || "").toUpperCase() === channel ? 1 : 0;
+      return aIsExact - bIsExact;
+    });
+
+    // Channel SKU Mapping Lookup (e.g. SCV-SSSPM-700-2 -> masterSku: Paneer Maker 700ML, multiplier: 1)
+    const channelMappingMap = new Map<string, { masterSku: string; multiplier: number }>();
+    for (const m of sortedMappings) {
+      const clean = m.channelSku.toLowerCase().trim();
+      const val = { masterSku: m.product.sku, multiplier: m.multiplier || 1 };
+      channelMappingMap.set(clean, val);
+      const norm = clean.replace(/[^A-Za-z0-9]/g, "");
+      if (norm) {
+        channelMappingMap.set(norm, val);
+      }
+    }
+
+    // Known SKUs for parsing this specific label:
+    // Only includes master product SKUs + channel-relevant listing SKUs.
+    // Sorted by length descending so longer/more specific SKUs are tested first!
+    const knownSkus = Array.from(
+      new Set([
+        ...allProducts.map((p) => p.sku),
+        ...relevantMappings.map((m) => m.channelSku),
+      ])
+    ).sort((a, b) => b.length - a.length);
+
     const productBySkuMap = new Map<string, typeof allProducts[0]>();
     for (const prod of allProducts) {
       productBySkuMap.set(prod.sku.toLowerCase().trim(), prod);
@@ -911,41 +938,219 @@ export async function POST(req: NextRequest) {
     )[] = [];
 
     if (channel === "AMAZON") {
-      // Group Amazon Shipping Label (Page 1) and Tax Invoice (Page 2) by Order ID
-      const amazonOrdersMap = new Map<string, string>();
+      // Check if Amazon pairs: odd page (label image), even page (tax invoice digital text)
+      const isAmazonPairs =
+        doc.numPages >= 2 &&
+        pageDataList[0].text.length < 30 &&
+        /Tax Invoice|ASSPL-Amazon|Order Number/i.test(pageDataList[1]?.text || "");
 
-      for (const pt of labelTexts) {
-        const orderMatch =
-          pt.match(/Order\s*(?:Id|Number)[:\s]*([0-9]{3}-[0-9]{7}-[0-9]{7})/i) ||
-          pt.match(/\b([0-9]{3}-[0-9]{7}-[0-9]{7})\b/);
+      if (isAmazonPairs) {
+        for (let i = 0; i < doc.numPages; i += 2) {
+          const labelItem = pageDataList[i];
+          const invoiceItem = i + 1 < doc.numPages ? pageDataList[i + 1] : null;
 
-        const orderId = orderMatch ? orderMatch[1].trim() : `AMAZON-${amazonOrdersMap.size + 1}`;
-        const prev = amazonOrdersMap.get(orderId) || "";
-        amazonOrdersMap.set(orderId, prev + "\n\n" + pt);
+          // 1. Dynamic Barcode decode from label canvas (<15ms per page)
+          let awb = "N/A";
+          try {
+            const vp = labelItem.pageObj.getViewport({ scale: 1.0 });
+            const cvs = createCanvas(vp.width, vp.height);
+            await labelItem.pageObj.render({ canvasContext: cvs.getContext("2d"), viewport: vp }).promise;
+
+            const decoded = decodeDynamicBarcode(cvs, vp.width, vp.height);
+            if (decoded) {
+              awb = decoded;
+            }
+          } catch (e) {
+            console.error("Barcode read error on page", i + 1, e);
+          }
+
+          // 2. Parse from invoice digital text
+          const invText = invoiceItem ? invoiceItem.text : "";
+          const ord = parseAmazonOrderBlock(invText, knownSkus);
+          if (awb !== "N/A") {
+            ord.awb = awb;
+          }
+          // Resolve accurate courier partner (Ground truth label text > AWB carrier series > Marketplace default)
+          ord.courier = resolveCourier(labelItem.text || invText, ord.awb, "AMAZON");
+          parsedOrders.push(ord);
+        }
+      } else {
+        // Amazon non-paired or single pages
+        for (let i = 0; i < pageDataList.length; i++) {
+          const p = pageDataList[i];
+          if (p.text.length >= 30) {
+            const ord = parseAmazonOrderBlock(p.text, knownSkus);
+            ord.courier = resolveCourier(p.text, ord.awb, "AMAZON");
+            parsedOrders.push(ord);
+          } else {
+            try {
+              const vp = p.pageObj.getViewport({ scale: 1.0 });
+              const cvs = createCanvas(vp.width, vp.height);
+              await p.pageObj.render({ canvasContext: cvs.getContext("2d"), viewport: vp }).promise;
+              const decoded = decodeDynamicBarcode(cvs, vp.width, vp.height);
+              const barcodeAwb = decoded || (pageDataList.length === 1 ? "AMAZON-1" : `AMAZON-${i + 1}`);
+              const courier = resolveCourier(p.text, barcodeAwb, "AMAZON");
+              parsedOrders.push({
+                orderId: `ORD-${barcodeAwb}`,
+                orderDate: "",
+                awb: barcodeAwb,
+                paymentType: "PREPAID",
+                customerName: "",
+                destination: "",
+                courier,
+                items: [],
+                hasMissingSku: true,
+                missingSkuError: "Label me SKU code detect nahi ho paya.",
+              });
+            } catch {
+              // skip
+            }
+          }
+        }
       }
-
-      parsedOrders = Array.from(amazonOrdersMap.values())
-        .map((combinedText) => parseAmazonOrderBlock(combinedText, knownSkus))
-        .filter((o) => (o.orderId && o.orderId.length > 5) || o.items.length > 0);
     } else if (channel === "MEESHO") {
-      parsedOrders = labelTexts
-        .map((pt) => parseMeeshoPage(pt, knownSkus))
+      parsedOrders = pageDataList
+        .filter((p) => p.text.length > 20)
+        .map((p) => {
+          const ord = parseMeeshoPage(p.text, knownSkus);
+          ord.courier = resolveCourier(p.text, ord.awb, "MEESHO");
+          return ord;
+        })
         .filter((o) => (o.orderId && o.orderId.length > 5) || o.items.length > 0);
     } else if (channel === "FLIPKART") {
-      parsedOrders = labelTexts
-        .map((pt) => parseFlipkartPage(pt, knownSkus))
+      parsedOrders = pageDataList
+        .filter((p) => p.text.length > 20)
+        .map((p) => {
+          const ord = parseFlipkartPage(p.text, knownSkus);
+          ord.courier = resolveCourier(p.text, ord.awb, "FLIPKART");
+          return ord;
+        })
         .filter((o) => (o.orderId && o.orderId.length > 5) || o.items.length > 0);
     } else {
-      parsedOrders = labelTexts
-        .map((pt) => parseGenericOrderBlock(pt, knownSkus))
-        .filter((o) => (o.orderId && o.orderId.length > 5) || o.items.length > 0);
+      for (const p of pageDataList) {
+        if (p.text.length > 20) {
+          const ord = parseGenericOrderBlock(p.text, knownSkus);
+          ord.courier = resolveCourier(p.text, ord.awb, "OTHER");
+          parsedOrders.push(ord);
+        } else {
+          try {
+            const vp = p.pageObj.getViewport({ scale: 1.0 });
+            const cvs = createCanvas(vp.width, vp.height);
+            await p.pageObj.render({ canvasContext: cvs.getContext("2d"), viewport: vp }).promise;
+            const decoded = decodeDynamicBarcode(cvs, vp.width, vp.height);
+            if (decoded) {
+              const courier = resolveCourier(p.text, decoded, "OTHER");
+              parsedOrders.push({
+                orderId: `ORD-${decoded}`,
+                orderDate: "",
+                awb: decoded,
+                paymentType: "PREPAID",
+                customerName: "",
+                destination: "",
+                courier,
+                items: [],
+                hasMissingSku: true,
+                missingSkuError: "Label me SKU code detect nahi ho paya.",
+              });
+            }
+          } catch {}
+        }
+      }
     }
+
+    // Deduplicate orders by unique Order ID / AWB (keeps richest order if duplicate pages exist)
+    const dedupedOrders: typeof parsedOrders = [];
+    const seenOrderKeys = new Set<string>();
+
+    for (const ord of parsedOrders) {
+      const key =
+        ord.awb && ord.awb !== "N/A"
+          ? `AWB:${ord.awb.toUpperCase()}`
+          : ord.orderId && !ord.orderId.startsWith("ORDER-") && !ord.orderId.startsWith("MEESHO-")
+          ? `ORD:${ord.orderId.toUpperCase()}`
+          : null;
+
+      if (!key) {
+        dedupedOrders.push(ord);
+        continue;
+      }
+
+      if (!seenOrderKeys.has(key)) {
+        seenOrderKeys.add(key);
+        dedupedOrders.push(ord);
+      } else {
+        const existingIdx = dedupedOrders.findIndex(
+          (o) =>
+            (o.awb && `AWB:${o.awb.toUpperCase()}` === key) ||
+            (o.orderId && `ORD:${o.orderId.toUpperCase()}` === key)
+        );
+        if (existingIdx !== -1 && dedupedOrders[existingIdx].items.length === 0 && ord.items.length > 0) {
+          dedupedOrders[existingIdx] = ord;
+        }
+      }
+    }
+    parsedOrders = dedupedOrders;
 
     if (parsedOrders.length === 0) {
       return NextResponse.json(
         { success: false, error: "No recognizable shipping labels or invoices found in this PDF." },
         { status: 400 }
       );
+    }
+
+    // 4.5 CHECK FOR DUPLICATE DISPATCH (ORDERS ALREADY DISPATCHED)
+    const awbsToCheck = Array.from(
+      new Set(
+        parsedOrders
+          .map((o) => o.awb?.trim())
+          .filter((a): a is string => Boolean(a && a !== "N/A" && a.length > 3))
+      )
+    );
+    const orderIdsToCheck = Array.from(
+      new Set(
+        parsedOrders
+          .map((o) => o.orderId?.trim())
+          .filter((id): id is string => Boolean(id && !id.startsWith("ORDER-") && id.length > 3))
+      )
+    );
+
+    const existingDispatched =
+      awbsToCheck.length > 0 || orderIdsToCheck.length > 0
+        ? await prisma.dispatchedOrder.findMany({
+            where: {
+              status: { not: "CANCELLED" },
+              OR: [
+                ...(awbsToCheck.length > 0 ? [{ awb: { in: awbsToCheck } }] : []),
+                ...(orderIdsToCheck.length > 0 ? [{ orderId: { in: orderIdsToCheck } }] : []),
+              ],
+            },
+            select: {
+              id: true,
+              orderId: true,
+              awb: true,
+              dispatchedAt: true,
+              createdAt: true,
+              status: true,
+              batch: {
+                select: {
+                  fileName: true,
+                  createdAt: true,
+                },
+              },
+            },
+          })
+        : [];
+
+    const duplicateByAwb = new Map<string, (typeof existingDispatched)[0]>();
+    const duplicateByOrderId = new Map<string, (typeof existingDispatched)[0]>();
+
+    for (const row of existingDispatched) {
+      if (row.awb && row.awb !== "N/A") {
+        duplicateByAwb.set(row.awb.toLowerCase().trim(), row);
+      }
+      if (row.orderId && !row.orderId.startsWith("ORDER-")) {
+        duplicateByOrderId.set(row.orderId.toLowerCase().trim(), row);
+      }
     }
 
     // 5. AGGREGATE SKU SUMMARY & ENRICH ORDERS
@@ -955,6 +1160,7 @@ export async function POST(req: NextRequest) {
         sku: string;
         name: string;
         totalQuantity: number;
+        duplicateQuantity: number;
         currentStock: number;
         afterStock: number;
         productId: string | null;
@@ -963,28 +1169,59 @@ export async function POST(req: NextRequest) {
     >();
 
     const enrichedOrders = parsedOrders.map((order, idx) => {
+      const cleanAwb = order.awb && order.awb !== "N/A" ? order.awb.toLowerCase().trim() : null;
+      const cleanOrdId =
+        order.orderId && !order.orderId.startsWith("ORDER-")
+          ? order.orderId.toLowerCase().trim()
+          : null;
+      const duplicateRecord =
+        (cleanAwb ? duplicateByAwb.get(cleanAwb) : null) ||
+        (cleanOrdId ? duplicateByOrderId.get(cleanOrdId) : null);
+
+      const isAlreadyDispatched = Boolean(duplicateRecord);
+      const duplicateDispatchedAt = duplicateRecord
+        ? (duplicateRecord.dispatchedAt || duplicateRecord.createdAt).toISOString()
+        : null;
+      const duplicateBatchFileName = duplicateRecord?.batch?.fileName || null;
+
       const enrichedItems = order.items.map((item) => {
-        const matchedProduct = productBySkuMap.get(item.sku.toLowerCase().trim());
+        // 1. Resolve through SkuMapping lookup (Multi-listing support)
+        const cleanSku = item.sku.toLowerCase().trim();
+        const normSku = cleanSku.replace(/[^A-Za-z0-9]/g, "");
+        const mapped = channelMappingMap.get(cleanSku) || channelMappingMap.get(normSku);
+
+        const targetSku = mapped ? mapped.masterSku : item.sku;
+        const finalQuantity = mapped ? item.quantity * mapped.multiplier : item.quantity;
+
+        const matchedProduct = productBySkuMap.get(targetSku.toLowerCase().trim());
         const found = !!matchedProduct;
 
-        const existing = skuSummaryMap.get(item.sku) || {
-          sku: item.sku,
+        const existing = skuSummaryMap.get(targetSku) || {
+          sku: targetSku,
           name: matchedProduct ? matchedProduct.name : item.description,
           totalQuantity: 0,
+          duplicateQuantity: 0,
           currentStock: matchedProduct ? matchedProduct.currentStock : 0,
           afterStock: matchedProduct ? matchedProduct.currentStock : 0,
           productId: matchedProduct ? matchedProduct.id : null,
           found,
         };
 
-        existing.totalQuantity += item.quantity;
-        if (matchedProduct) {
-          existing.afterStock = existing.currentStock - existing.totalQuantity;
+        if (isAlreadyDispatched) {
+          existing.duplicateQuantity += finalQuantity;
+        } else {
+          existing.totalQuantity += finalQuantity;
+          if (matchedProduct) {
+            existing.afterStock = existing.currentStock - existing.totalQuantity;
+          }
         }
-        skuSummaryMap.set(item.sku, existing);
+        skuSummaryMap.set(targetSku, existing);
 
         return {
-          ...item,
+          sku: targetSku,
+          originalSku: item.sku !== targetSku ? item.sku : undefined,
+          description: item.description,
+          quantity: finalQuantity,
           productId: matchedProduct?.id || null,
           productName: matchedProduct?.name || item.description,
           currentStock: matchedProduct?.currentStock ?? null,
@@ -1004,12 +1241,17 @@ export async function POST(req: NextRequest) {
         hasMissingSku: order.hasMissingSku ?? order.items.length === 0,
         missingSkuError: order.missingSkuError,
         items: enrichedItems,
+        isAlreadyDispatched,
+        dispatchedAt: duplicateDispatchedAt,
+        duplicateBatchFileName,
       };
     });
 
     const skuSummary = Array.from(skuSummaryMap.values());
     const totalOrders = enrichedOrders.length;
     const totalUnits = skuSummary.reduce((sum, s) => sum + s.totalQuantity, 0);
+    const duplicateOrdersCount = enrichedOrders.filter((o) => o.isAlreadyDispatched).length;
+    const allOrdersDuplicate = duplicateOrdersCount === totalOrders && totalOrders > 0;
     const unreadOrdersCount = enrichedOrders.filter((o) => o.items.length === 0).length;
     const allSkusFound =
       skuSummary.length > 0 &&
@@ -1023,10 +1265,18 @@ export async function POST(req: NextRequest) {
         channelLabel,
         totalOrders,
         totalUnits,
+        duplicateOrdersCount,
+        allOrdersDuplicate,
         allSkusFound,
         unreadOrdersCount,
         skuSummary,
         orders: enrichedOrders,
+        availableProducts: allProducts.map((p) => ({
+          id: p.id,
+          name: p.name,
+          sku: p.sku,
+          currentStock: p.currentStock,
+        })),
       },
     });
   } catch (error: any) {

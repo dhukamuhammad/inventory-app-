@@ -1,7 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { Plus, Package, Zap } from "lucide-react";
+import Link from "next/link";
+import { Plus, Package, Zap, RotateCcw, FileText } from "lucide-react";
 import { Product, Category } from "@prisma/client";
 import { DesktopTable } from "@/components/inventory/DesktopTable";
 import { MobileCardList } from "@/components/inventory/MobileCardList";
@@ -114,6 +115,22 @@ export function InventoryClient({ products, categories, platforms }: InventoryCl
           <h1 className="text-xl font-bold text-gray-900 mt-1 truncate">Inventory</h1>
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
+          <Link
+            href="/dispatch-history"
+            className="inline-flex items-center gap-1 bg-indigo-50 active:bg-indigo-100 text-indigo-700 border border-indigo-200/80 px-2 py-2 rounded-xl text-xs font-semibold shadow-xs transition-all active:scale-95 touch-manipulation cursor-pointer"
+            title="View past PDF dispatch batches"
+          >
+            <FileText className="w-3.5 h-3.5 text-indigo-600" />
+            <span className="hidden xs:inline">History</span>
+          </Link>
+          <Link
+            href="/returns"
+            className="inline-flex items-center gap-1 bg-amber-50 active:bg-amber-100 text-amber-700 border border-amber-200/80 px-2 py-2 rounded-xl text-xs font-semibold shadow-xs transition-all active:scale-95 touch-manipulation cursor-pointer"
+            title="Scan Order ID or AWB for return inward"
+          >
+            <RotateCcw className="w-3.5 h-3.5 text-amber-600" />
+            <span className="hidden xs:inline">Returns</span>
+          </Link>
           <button 
             type="button"
             onClick={() => setIsBulkDispatchOpen(true)}
@@ -141,6 +158,20 @@ export function InventoryClient({ products, categories, platforms }: InventoryCl
           <p className="text-gray-500 mt-1">Manage your products, automated dispatch, and stock</p>
         </div>
         <div className="flex items-center gap-3">
+          <Link
+            href="/dispatch-history"
+            className="inline-flex items-center justify-center gap-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200/80 px-4 py-2.5 rounded-xl font-medium transition-all active:scale-95 shadow-xs cursor-pointer touch-manipulation"
+          >
+            <FileText className="w-4 h-4 text-indigo-600" />
+            Dispatch History
+          </Link>
+          <Link
+            href="/returns"
+            className="inline-flex items-center justify-center gap-2 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200/80 px-4 py-2.5 rounded-xl font-medium transition-all active:scale-95 shadow-xs cursor-pointer touch-manipulation"
+          >
+            <RotateCcw className="w-4 h-4 text-amber-600" />
+            Returns & RTO Inward
+          </Link>
           <button 
             type="button"
             onClick={() => setIsBulkDispatchOpen(true)}

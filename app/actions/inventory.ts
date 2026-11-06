@@ -96,11 +96,78 @@ export async function updateProduct(id: string, data: { name: string; sku: strin
 }
 
 export async function deleteProduct(id: string) {
-  await prisma.product.delete({
-    where: { id },
+  await prisma.$transaction(async (tx) => {
+    // 1. Find all dispatched order items for this product
+    const items = await tx.dispatchedOrderItem.findMany({
+      where: { productId: id },
+      include: { dispatchedOrder: true },
+    });
+
+    const affectedOrderIds = Array.from(
+      new Set(items.map((it) => it.dispatchedOrderId))
+    );
+    const affectedBatchIds = new Set<string>();
+
+    for (const orderId of affectedOrderIds) {
+      const order = await tx.dispatchedOrder.findUnique({
+        where: { id: orderId },
+        include: { items: true },
+      });
+
+      if (!order) continue;
+      if (order.batchId) {
+        affectedBatchIds.add(order.batchId);
+      }
+
+      // If the order ONLY contains items of this product, delete the order
+      const remainingItems = order.items.filter((it) => it.productId !== id);
+      if (remainingItems.length === 0) {
+        await tx.dispatchedOrder.delete({
+          where: { id: orderId },
+        });
+      }
+    }
+
+    // 2. Check affected batches: delete if empty, or recalculate counts
+    for (const batchId of affectedBatchIds) {
+      const remainingOrders = await tx.dispatchedOrder.findMany({
+        where: { batchId },
+        include: { items: true },
+      });
+
+      if (remainingOrders.length === 0) {
+        await tx.dispatchBatch.delete({
+          where: { id: batchId },
+        });
+      } else {
+        const newTotalOrders = remainingOrders.length;
+        const newTotalUnits = remainingOrders.reduce(
+          (sum, ord) => sum + ord.items.reduce((s, it) => s + it.quantity, 0),
+          0
+        );
+        await tx.dispatchBatch.update({
+          where: { id: batchId },
+          data: {
+            totalOrders: newTotalOrders,
+            totalUnits: newTotalUnits,
+          },
+        });
+      }
+    }
+
+    // 3. Delete the product itself (cascades movements, mappings)
+    await tx.product.delete({
+      where: { id },
+    });
   });
+
   revalidatePath("/inventory");
   revalidatePath("/dashboard");
+  revalidatePath("/dispatch-history");
+  revalidatePath("/movements");
+  revalidatePath("/analytics");
+  revalidatePath("/returns");
+  revalidatePath("/mappings");
 }
 
 import { sendWhatsAppAlert } from "@/lib/whatsapp";
@@ -275,16 +342,21 @@ export async function processReturns(data: {
 // --- ANALYTICS / INSIGHTS ---
 
 export async function getProductInsights(productId: string) {
-  const product = await prisma.product.findUnique({
-    where: { id: productId },
-    include: {
-      category: true,
-      movements: {
-        orderBy: { date: "desc" },
-        include: { platform: true },
+  const [product, platforms] = await Promise.all([
+    prisma.product.findUnique({
+      where: { id: productId },
+      include: {
+        category: true,
+        movements: {
+          orderBy: { date: "desc" },
+          include: { platform: true },
+        },
       },
-    },
-  });
+    }),
+    prisma.platform.findMany({
+      orderBy: { name: "asc" },
+    }),
+  ]);
 
   if (!product) return null;
 
@@ -376,6 +448,7 @@ export async function getProductInsights(productId: string) {
     },
     platformPerformance,
     history: movements,
+    platforms,
   };
 }
 
@@ -451,6 +524,65 @@ export async function deleteStockMovement(movementId: string) {
       }
     }
 
+    // 3.5 Two-Way Sync with Dispatch History:
+    // If this OUT movement came from a bulk dispatch, mark the order CANCELLED
+    // and if all orders in the batch are cancelled, mark the batch REVERTED!
+    if (type === "OUT" && movement.note) {
+      const orderMatch = movement.note.match(/(?:Amazon|Meesho|Flipkart|Other)?\s*Order:\s*([^\s|]+)/i);
+      const awbMatch = movement.note.match(/AWB:\s*([^\s|]+)/i);
+      const orderId = orderMatch ? orderMatch[1].trim() : null;
+      const awb = awbMatch ? awbMatch[1].trim() : null;
+
+      if (orderId || awb) {
+        const matchingOrders = await tx.dispatchedOrder.findMany({
+          where: {
+            OR: [
+              ...(orderId ? [{ orderId }] : []),
+              ...(awb ? [{ awb }] : []),
+            ],
+          },
+        });
+
+        for (const dispOrder of matchingOrders) {
+          // Update order status to CANCELLED
+          await tx.dispatchedOrder.update({
+            where: { id: dispOrder.id },
+            data: { status: "CANCELLED" },
+          });
+
+          // Check if this order was part of a batch
+          if (dispOrder.batchId) {
+            const batchId = dispOrder.batchId;
+            const remainingActive = await tx.dispatchedOrder.findMany({
+              where: {
+                batchId,
+                status: { not: "CANCELLED" },
+                id: { not: dispOrder.id },
+              },
+            });
+
+            if (remainingActive.length === 0) {
+              await tx.dispatchBatch.update({
+                where: { id: batchId },
+                data: {
+                  status: "REVERTED",
+                  revertedAt: new Date(),
+                },
+              });
+            } else {
+              await tx.dispatchBatch.update({
+                where: { id: batchId },
+                data: {
+                  totalUnits: { decrement: quantity },
+                  totalOrders: { decrement: 1 },
+                },
+              });
+            }
+          }
+        }
+      }
+    }
+
     // 4. Delete the movement entry
     await tx.stockMovement.delete({
       where: { id: movementId },
@@ -470,6 +602,152 @@ export async function deleteStockMovement(movementId: string) {
     });
 
     return { success: true, updatedProduct };
+  });
+
+  revalidatePath("/inventory");
+  revalidatePath("/dashboard");
+  revalidatePath("/movements");
+  revalidatePath("/analytics");
+  revalidatePath("/dispatch-history");
+  return result;
+}
+
+// --- UPDATE / EDIT STOCK MOVEMENT ---
+
+export interface UpdateStockMovementInput {
+  movementId: string;
+  quantity: number;
+  unitCost?: number | null;
+  platformId?: string | null;
+  note?: string | null;
+  date?: string | Date;
+}
+
+export async function updateStockMovement(input: UpdateStockMovementInput) {
+  const { movementId, quantity: newQuantity, unitCost, platformId, note, date } = input;
+
+  if (!newQuantity || newQuantity <= 0) {
+    throw new Error("Quantity must be a positive number greater than 0");
+  }
+
+  const result = await prisma.$transaction(async (tx) => {
+    // 1. Find existing movement
+    const movement = await tx.stockMovement.findUnique({
+      where: { id: movementId },
+    });
+
+    if (!movement) {
+      throw new Error("Movement entry not found");
+    }
+
+    const { productId, type, quantity: oldQuantity } = movement;
+
+    // 2. Fetch current product
+    const currentProd = await tx.product.findUnique({
+      where: { id: productId },
+    });
+
+    if (!currentProd) {
+      throw new Error("Product not found");
+    }
+
+    // 3. Calculate stock adjustments
+    // Delta = newQuantity - oldQuantity
+    const qtyDiff = newQuantity - oldQuantity;
+    let currentStockAdjust = 0;
+    let defectiveStockAdjust = 0;
+
+    if (type === "IN" || type === "RETURN_RTO" || type === "RETURN_GOOD") {
+      // Added stock: if newQty > oldQty, add difference. If newQty < oldQty, subtract difference.
+      currentStockAdjust = qtyDiff;
+    } else if (type === "OUT") {
+      // Deducted stock: if newQty > oldQty, deduct more (negative). If newQty < oldQty, return stock (positive).
+      currentStockAdjust = -qtyDiff;
+    } else if (type === "RETURN_DEFECTIVE" || type === "RETURN_RTO_DEFECTIVE") {
+      // Defective stock added.
+      defectiveStockAdjust = qtyDiff;
+    }
+
+    // Safety checks: Ensure warehouse stock doesn't become negative
+    if (currentStockAdjust < 0 && currentProd.currentStock + currentStockAdjust < 0) {
+      throw new Error(
+        `Cannot update entry: Resulting warehouse stock would become negative (${currentProd.currentStock + currentStockAdjust} pcs). Current warehouse stock is ${currentProd.currentStock} pcs.`
+      );
+    }
+
+    if (defectiveStockAdjust < 0 && currentProd.defectiveStock + defectiveStockAdjust < 0) {
+      throw new Error(
+        `Cannot update entry: Resulting defective stock would become negative (${currentProd.defectiveStock + defectiveStockAdjust} pcs).`
+      );
+    }
+
+    // 4. Recalculate Weighted Average Cost if it's an IN movement
+    let recalculatedCost: number | undefined = undefined;
+
+    if (type === "IN") {
+      const allInMovements = await tx.stockMovement.findMany({
+        where: {
+          productId,
+          type: "IN",
+        },
+        orderBy: { date: "asc" },
+      });
+
+      let totalVal = 0;
+      let totalQty = 0;
+
+      for (const m of allInMovements) {
+        if (m.id === movementId) {
+          const effectiveCost = unitCost !== undefined ? (unitCost ?? 0) : (m.unitCost ?? 0);
+          if (effectiveCost > 0) {
+            totalQty += newQuantity;
+            totalVal += newQuantity * effectiveCost;
+          }
+        } else {
+          if (m.unitCost && m.unitCost > 0) {
+            totalQty += m.quantity;
+            totalVal += m.quantity * m.unitCost;
+          }
+        }
+      }
+
+      if (totalQty > 0) {
+        recalculatedCost = Number((totalVal / totalQty).toFixed(2));
+      } else {
+        recalculatedCost = 0;
+      }
+    }
+
+    // 5. Update the movement entry
+    const updatedMovement = await tx.stockMovement.update({
+      where: { id: movementId },
+      data: {
+        quantity: newQuantity,
+        ...(unitCost !== undefined && { unitCost: unitCost !== null && unitCost > 0 ? unitCost : null }),
+        ...(platformId !== undefined && { platformId: platformId && platformId !== "MANUAL" && platformId !== "ALL" ? platformId : null }),
+        ...(note !== undefined && { note: note ? note.trim() : null }),
+        ...(date && { date: new Date(date) }),
+        isEdited: true,
+      },
+      include: {
+        platform: true,
+      },
+    });
+
+    // 6. Update the product
+    const updatedProduct = await tx.product.update({
+      where: { id: productId },
+      data: {
+        ...(currentStockAdjust !== 0 && { currentStock: { increment: currentStockAdjust } }),
+        ...(defectiveStockAdjust !== 0 && { defectiveStock: { increment: defectiveStockAdjust } }),
+        ...(recalculatedCost !== undefined && { costPrice: recalculatedCost }),
+      },
+      include: {
+        category: true,
+      },
+    });
+
+    return { success: true, updatedMovement, updatedProduct };
   });
 
   revalidatePath("/inventory");
@@ -529,3 +807,120 @@ export async function getGlobalAnalytics() {
   };
 }
 
+// --- SKU MAPPINGS ---
+export async function getSkuMappings() {
+  return prisma.skuMapping.findMany({
+    orderBy: { createdAt: "desc" },
+    include: {
+      product: {
+        include: {
+          category: true,
+        },
+      },
+    },
+  });
+}
+
+export async function getProductsWithMappings() {
+  const [products, mappings] = await Promise.all([
+    prisma.product.findMany({
+      orderBy: { name: "asc" },
+      include: {
+        category: true,
+      },
+    }),
+    prisma.skuMapping.findMany({
+      orderBy: { createdAt: "desc" },
+    }),
+  ]);
+
+  const mappingsByProduct = new Map<string, typeof mappings>();
+  for (const m of mappings) {
+    const list = mappingsByProduct.get(m.productId) || [];
+    list.push(m);
+    mappingsByProduct.set(m.productId, list);
+  }
+
+  return products.map((p) => ({
+    ...p,
+    mappings: mappingsByProduct.get(p.id) || [],
+  }));
+}
+
+export async function addSkuMappings({
+  productId,
+  channelSkus,
+  platform = "ALL",
+  multiplier = 1,
+}: {
+  productId: string;
+  channelSkus: string[];
+  platform?: string;
+  multiplier?: number;
+}) {
+  const cleanSkus = channelSkus
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+
+  if (cleanSkus.length === 0) {
+    throw new Error("Kam se kam ek Channel SKU daalein.");
+  }
+
+  const results = [];
+  for (const cSku of cleanSkus) {
+    const mapping = await prisma.skuMapping.upsert({
+      where: {
+        channelSku_platform: {
+          channelSku: cSku,
+          platform: platform.toUpperCase(),
+        },
+      },
+      update: {
+        productId,
+        multiplier: Math.max(1, multiplier || 1),
+      },
+      create: {
+        channelSku: cSku,
+        platform: platform.toUpperCase(),
+        productId,
+        multiplier: Math.max(1, multiplier || 1),
+      },
+    });
+    results.push(mapping);
+  }
+
+  revalidatePath("/mappings");
+  revalidatePath("/inventory");
+  return results;
+}
+
+export async function updateSkuMapping(
+  id: string,
+  data: {
+    channelSku?: string;
+    platform?: string;
+    multiplier?: number;
+    productId?: string;
+  }
+) {
+  const updateData: any = {};
+  if (data.channelSku) updateData.channelSku = data.channelSku.trim();
+  if (data.platform) updateData.platform = data.platform.toUpperCase();
+  if (data.multiplier) updateData.multiplier = Math.max(1, data.multiplier);
+  if (data.productId) updateData.productId = data.productId;
+
+  const mapping = await prisma.skuMapping.update({
+    where: { id },
+    data: updateData,
+  });
+
+  revalidatePath("/mappings");
+  revalidatePath("/inventory");
+  return mapping;
+}
+
+export async function deleteSkuMapping(id: string) {
+  await prisma.skuMapping.delete({ where: { id } });
+  revalidatePath("/mappings");
+  revalidatePath("/inventory");
+}

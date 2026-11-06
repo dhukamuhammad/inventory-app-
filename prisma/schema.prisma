@@ -31,6 +31,21 @@ model Product {
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
   movements       StockMovement[]
+  mappings        SkuMapping[]
+  dispatchedItems DispatchedOrderItem[]
+}
+
+model SkuMapping {
+  id          String    @id @default(uuid())
+  channelSku  String
+  platform    String    @default("ALL") // "MEESHO" | "FLIPKART" | "AMAZON" | "ALL"
+  productId   String
+  product     Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  multiplier  Int       @default(1)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([channelSku, platform])
 }
 
 model StockMovement {
@@ -44,4 +59,65 @@ model StockMovement {
   platform   Platform? @relation(fields: [platformId], references: [id])
   note       String?
   date       DateTime  @default(now())
+  isEdited   Boolean   @default(false)
+  updatedAt  DateTime? @updatedAt
 }
+
+model DispatchedOrder {
+  id             String                @id @default(uuid())
+  orderId        String                // E.g. "OD1234567890" or "123456789_1"
+  awb            String?               // Courier tracking number (e.g. "FMPC123456789")
+  channel        String                // "FLIPKART" | "MEESHO" | "AMAZON"
+  courier        String?               // "DELHIVERY", "E-KART", "SHADOWFAX", etc.
+  customerName   String?               // Buyer name
+  destination    String?               // City, State, Pincode
+  paymentType    String?               // "COD" | "PREPAID"
+  status         String                @default("DISPATCHED") // "DISPATCHED" | "RETURN_RTO" | "RETURN_CUSTOMER" | "DELIVERED"
+  condition      String?               // "GOOD" | "DEFECTIVE"
+  returnNote     String?               // Reason or SPF claim notes
+  dispatchedAt   DateTime              @default(now())
+  returnedAt     DateTime?
+  items          DispatchedOrderItem[]
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+
+  batchId        String?
+  batch          DispatchBatch?        @relation(fields: [batchId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@index([awb])
+  @@index([status])
+  @@index([batchId])
+}
+
+model DispatchedOrderItem {
+  id                String          @id @default(uuid())
+  dispatchedOrderId String
+  dispatchedOrder   DispatchedOrder @relation(fields: [dispatchedOrderId], references: [id], onDelete: Cascade)
+  productId         String
+  product           Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  channelSku        String?
+  quantity          Int             @default(1)
+  unitCost          Float?
+  createdAt         DateTime        @default(now())
+}
+
+model DispatchBatch {
+  id             String            @id @default(uuid())
+  fileName       String
+  channel        String            // "MEESHO" | "FLIPKART" | "AMAZON" | "OTHER"
+  totalOrders    Int               @default(0)
+  totalUnits     Int               @default(0)
+  courierSummary String?           // JSON string: { "Delhivery": 12, "Shadowfax": 8 }
+  skuSummary     String?           // JSON string: Array of SkuSummary items
+  status         String            @default("CONFIRMED") // "CONFIRMED" | "REVERTED"
+  revertedAt     DateTime?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  orders         DispatchedOrder[]
+
+  @@index([channel])
+  @@index([status])
+  @@index([createdAt])
+}
+
