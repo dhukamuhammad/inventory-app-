@@ -89,6 +89,8 @@ export async function POST(req: NextRequest) {
     revalidatePath("/movements");
     revalidatePath("/dashboard");
     revalidatePath("/analytics");
+    revalidatePath("/dispatch-history");
+    revalidatePath("/returns");
 
     return NextResponse.json({
       success: true,
