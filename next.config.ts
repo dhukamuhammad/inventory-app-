@@ -42,7 +42,7 @@ function getLocalDevOrigins(): string[] {
 const nextConfig: NextConfig = {
   devIndicators: false,
   allowedDevOrigins: getLocalDevOrigins(),
-  output: 'standalone',
+  output: process.env.VERCEL ? undefined : 'standalone',
   serverExternalPackages: ['pdf-parse', '@napi-rs/canvas'],
 };
 
