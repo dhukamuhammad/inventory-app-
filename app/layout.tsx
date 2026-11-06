@@ -9,9 +9,14 @@ import { BottomNav } from "@/components/BottomNav";
 const outfit = Outfit({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "Inventory App",
-  description: "E-Commerce Inventory Management System",
+  title: "ScoviX Inventory",
+  description: "ScoviX E-Commerce Inventory & Dispatch Management System",
   manifest: "/manifest.json",
+  icons: {
+    icon: "/icons/icon-192.png",
+    shortcut: "/icons/icon-192.png",
+    apple: "/apple-touch-icon.png",
+  },
 };
 
 export default function RootLayout({
