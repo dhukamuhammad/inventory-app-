@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import path from "path";
+import fs from "fs";
+import { pathToFileURL } from "url";
 
 export const runtime = "nodejs";
 
@@ -795,6 +797,16 @@ export async function POST(req: NextRequest) {
 
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { PDFParse } = require("pdf-parse");
+    try {
+      const localWorkerPath = path.join(process.cwd(), "node_modules", "pdf-parse", "dist", "pdf-parse", "cjs", "pdf.worker.mjs");
+      if (fs.existsSync(localWorkerPath)) {
+        PDFParse.setWorker(pathToFileURL(localWorkerPath).href);
+      } else {
+        PDFParse.setWorker("https://cdn.jsdelivr.net/npm/pdf-parse@2.4.5/dist/pdf-parse/cjs/pdf.worker.mjs");
+      }
+    } catch (e) {
+      console.warn("Could not set custom PDF worker, falling back:", e);
+    }
     const fontPath = path.join(process.cwd(), "node_modules", "pdfjs-dist", "standard_fonts").replace(/\\/g, "/") + "/";
     const parser = new PDFParse({ data: uint8Array, standardFontDataUrl: fontPath });
     const doc = await parser.load();

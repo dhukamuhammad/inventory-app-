@@ -44,6 +44,9 @@ const nextConfig: NextConfig = {
   allowedDevOrigins: getLocalDevOrigins(),
   output: process.env.VERCEL ? undefined : 'standalone',
   serverExternalPackages: ['pdf-parse', '@napi-rs/canvas'],
+  outputFileTracingIncludes: {
+    '/api/**/*': ['./node_modules/pdf-parse/**/*'],
+  },
 };
 
 export default nextConfig;
